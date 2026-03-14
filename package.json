@@ -1,0 +1,8 @@
+{
+  "name": "festdaten-export",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "exceljs": "^4.4.0"
+  }
+}
