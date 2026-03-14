@@ -1,11 +1,14 @@
 // api/export-xlsx.js
-// Robust: Mapping beliebiger Template-Header → Persona-Variablen + XLSX-Schreiben mit exceljs.
+// Robust: Mapping beliebiger Template-Header → Persona-Variablen + Schreiben in die Vorlage.
 // Features:
-// - Heuristisches Spalten-Mapping (Q2/Q3/Q7/Q9/Q10/Q11 etc.)
-// - Duplikate (z. B. zwei Q10-Spalten) → deterministisch: 1.=Q10_Marke, 2.=Q10_Marke_Andere
-// - Sonderregel: Wenn Q10_Marke !== "10" → Q10_Marke_Andere = ""
-// - Preview (?preview=1) zeigt columns/firstRow/count ohne XLSX-Erzeugung
-// - Writer findet automatisch die erste vollständig leere Zeile unterhalb deines Templates
+// - Heuristisches Spalten-Mapping (Q2/Q3/Q7/Q9/Q10/Q11)
+// - Q10-Duplikate → 1.=Q10_Marke, 2.=Q10_Marke_Andere
+// - Sonderregel: wenn Q10_Marke !== "10" → Q10_Marke_Andere = ""
+// - Preview (?preview=1) zeigt columns/firstRow/count (ohne XLSX-Schreiben)
+// - Writer liest die bestehende Kopfzeile (keine neue Header-Zeile), findet erste leere Datenzeile
+// - "No."/ "Anzahl"/ "Nr" wird erkannt und 1..N durchnummeriert
+
+/* -------------------------- Normalisierung & Heuristik -------------------------- */
 
 function normalize(s) {
   return String(s || "")
@@ -15,22 +18,21 @@ function normalize(s) {
     .replace(/^_|_$/g, "");
 }
 
-// Heuristiken für Spalten → Variablen-Key
+// Heuristik: Template-Spalte → Variablen-Key im Persona-Datensatz
 function guessVarForColumn(rawName, personaKeys) {
   const col = normalize(rawName);
 
-  // 1) exakte/normalisierte Übereinstimmung mit vorhandenen Persona-Keys
+  // 1) Exakte/normalisierte Übereinstimmung mit vorhandenen Persona-Keys
   if (personaKeys.has(rawName)) return rawName;
   const byNorm = [...personaKeys].find(k => normalize(k) === col);
   if (byNorm) return byNorm;
 
-  // 2) häufige Variablenfamilien / Synonyme
+  // 2) Häufige Familien/Synonyme
   if (col.includes("q10") && (col.includes("andere") || col.includes("andern") || col.includes("other"))) {
     return "Q10_Marke_Andere";
   }
-  if (col.includes("q10")) {
-    return "Q10_Marke";
-  }
+  if (col.includes("q10")) return "Q10_Marke";
+
   if (col.includes("fett")) return "Q11_Fettgehalt";
   if (col.includes("ablehn") || col.includes("keine")) return "Q9_Ablehnung";
 
@@ -42,15 +44,14 @@ function guessVarForColumn(rawName, personaKeys) {
   if (col.includes("gender") || col.includes("geschlecht")) return "Q2_Gender";
   if (col.includes("age") || col.includes("alter") || col.includes("altersgruppe")) return "Q3_Age";
 
-  if (col === "no" || col.includes("nummer")) return "No";
+  if (col === "no" || col.includes("anzahl") || col === "nr") return "No";
 
   // 3) Fallback
   return null;
 }
 
-// Spalten-Mapping aus Codebook + Heuristik bauen
 function buildColumnMapping(codebook, samplePersonaRow) {
-  // Template-Spalten: bevorzugt column_order_raw; Fallback: variables[].raw/var
+  // Spalten aus dem Codebook: bevorzugt column_order_raw, sonst variables[].raw/var
   const columns =
     Array.isArray(codebook?.column_order_raw) && codebook.column_order_raw.length
       ? [...codebook.column_order_raw]
@@ -66,7 +67,7 @@ function buildColumnMapping(codebook, samplePersonaRow) {
     mapping.set(raw, guessVarForColumn(raw, personaKeys));
   }
 
-  // 2) Duplikate pro „Basis“
+  // 2) Duplikate nach "Basis" clustern
   const groups = new Map(); // base -> raw[]
   for (const raw of columns) {
     const nk = normalize(raw);
@@ -80,7 +81,7 @@ function buildColumnMapping(codebook, samplePersonaRow) {
     groups.get(base).push(raw);
   }
 
-  // Speziell Q10: genau zwei Spalten → 1.=Marke, 2.=Marke_Andere (wenn noch nicht gesetzt)
+  // Q10: genau zwei Spalten -> 1.=Marke, 2.=Marke_Andere (falls noch nicht gesetzt)
   if (groups.has("Q10")) {
     const q10cols = groups.get("Q10");
     if (q10cols.length === 2) {
@@ -93,7 +94,6 @@ function buildColumnMapping(codebook, samplePersonaRow) {
   return mapping; // Map<rawColumn, varKey|null>
 }
 
-// Persona → Template-Row (Keys = raw-Spalten); inkl. Sonderregel Q10_Marke_Andere
 function buildTemplateRow(personaRow, mapping) {
   const row = { ...personaRow };
 
@@ -111,7 +111,8 @@ function buildTemplateRow(personaRow, mapping) {
   return out;
 }
 
-// ====== Writer-Teil mit exceljs ======
+/* ------------------------------- XLSX-Writer ---------------------------------- */
+
 async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl) {
   const ExcelJS = (await import('exceljs')).default;
 
@@ -123,39 +124,54 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
   // 2) Erstes Worksheet (kein fixer Name nötig)
   const ws = workbook.worksheets[0] || workbook.addWorksheet('Daten');
 
-  // 3) Spaltenreihenfolge aus rows ableiten (stabil)
-  const columnsOrder = Array.from(
-    rows.reduce((set, r) => {
-      Object.keys(r).forEach(k => set.add(k));
-      return set;
-    }, new Set())
-  );
+  // 3) Erste vollständig leere Zeile = Datenstart (unterhalb Fragen/Antwortblock)
+  const startRow = findFirstFreeRow(ws, 300, 1);
+  // Falls du bewusst 1 Leerzeile Abstand wünschst:  const startRow = findFirstFreeRow(ws, 300, 1) + 1;
 
-  // 4) Erste vollständig leere Zeile unterhalb der Vorlage erkennen
-  const startRow = findFirstFreeRow(ws, Math.max(columnsOrder.length, 200), 1);
-  // Falls du bewusst eine Leerzeile Abstand willst:  const startRow = findFirstFreeRow(ws, Math.max(columnsOrder.length, 200), 1) + 1;
+  // 4) Kopfzeile ermitteln: letzte "inhaltstarke" Zeile darüber
+  const headerRowIdx = findHeaderRowAbove(ws, startRow - 1, 300);
+  if (!headerRowIdx) throw new Error('Kopfzeile im Template nicht gefunden – bitte prüfen.');
 
-  // 5) Kopfzeile schreiben
-  const headerRow = ws.getRow(startRow);
-  columnsOrder.forEach((key, idx) => {
-    headerRow.getCell(idx + 1).value = key;
-  });
-  headerRow.font = { bold: true };
-  headerRow.commit();
+  const header = readHeaderCells(ws, headerRowIdx, 300); // [{col, raw, norm}, ...]
+  if (!header.length) throw new Error('Leere Kopfzeile erkannt – bitte Template prüfen.');
 
-  // 6) Datenzeilen
-  let r = startRow + 1;
-  for (const obj of rows) {
+  // 5) "No."-Spalte erkennen (oder Default Spalte 1)
+  const noCol = findNoColumn(header) || 1;
+
+  // 6) Rohspaltennamen → Spaltenindex abbilden
+  const indexByRaw = new Map();
+  for (const h of header) {
+    if (!h.raw) continue;
+    indexByRaw.set(h.raw, h.col);
+  }
+
+  // 7) Daten schreiben (keine neue Kopfzeile!)
+  let r = startRow;
+  for (let i = 0; i < rows.length; i++) {
+    const obj = rows[i]; // <- bereits "mappedRows"
     const row = ws.getRow(r);
-    columnsOrder.forEach((key, idx) => {
-      const v = obj[key];
-      row.getCell(idx + 1).value = (v === null || v === undefined) ? '' : String(v);
-    });
+
+    // 7a) Laufende Nummer
+    row.getCell(noCol).value = i + 1;
+
+    // 7b) Spalten exakt per vorhandener Header-Beschriftung befüllen
+    for (const h of header) {
+      if (!h.raw) continue;
+      if (isNoLike(h.norm)) continue; // "No." nicht überschreiben
+
+      const v = obj[h.raw];
+      if (v !== undefined && v !== null) {
+        row.getCell(h.col).value = String(v);
+      } else {
+        // bewusst leer lassen → kein Shift/Einschub
+      }
+    }
+
     row.commit();
     r++;
   }
 
-  // 7) Optional: QA in 2. Sheet
+  // 8) Optional: QA in 2. Sheet
   if (qa && typeof qa === 'object' && Object.keys(qa).length) {
     const qaWs = workbook.addWorksheet('QA');
     let i = 1;
@@ -166,16 +182,55 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
     }
   }
 
-  // 8) → Base64 zurückgeben
+  // 9) → Base64 zurückgeben
   const out = await workbook.xlsx.writeBuffer();
   return Buffer.from(out).toString('base64');
 }
 
-// ——— Hilfsfunktionen: erste freie Zeile finden ———
+/* ----------------------------- Writer-Helfer ---------------------------------- */
+
+function findHeaderRowAbove(ws, fromRow, maxCols = 150) {
+  // Nimm die letzte Zeile vor startRow, die "deutlich" Inhalt hat (>= 3 befüllte Zellen)
+  for (let r = fromRow; r >= 1; r--) {
+    let filled = 0;
+    for (let c = 1; c <= maxCols; c++) {
+      const v = cellToString(ws.getRow(r).getCell(c)?.value);
+      if (v) filled++;
+      if (filled >= 3) return r;
+    }
+  }
+  return null;
+}
+
+function readHeaderCells(ws, headerRowIdx, maxCols = 150) {
+  const out = [];
+  const row = ws.getRow(headerRowIdx);
+  for (let c = 1; c <= maxCols; c++) {
+    const raw = cellToString(row.getCell(c)?.value);
+    if (!raw) continue;
+    out.push({ col: c, raw, norm: normalize(raw) });
+  }
+  return out;
+}
+
+function findNoColumn(headerCells) {
+  for (const h of headerCells) {
+    if (isNoLike(h.norm)) return h.col;
+  }
+  return null;
+}
+
+function isNoLike(normText) {
+  return normText === 'no' ||
+         normText.startsWith('no_') ||
+         normText.includes('anzahl') ||
+         normText === 'nr' ||
+         normText.startsWith('nr_');
+}
+
 function findFirstFreeRow(ws, maxCols = 150, consecutiveEmpty = 1) {
   const last = ws.lastRow ? ws.lastRow.number : 1;
   const scanTo = last + 200; // etwas Puffer
-
   for (let r = 1; r <= scanTo; r++) {
     if (isRowEmpty(ws, r, maxCols)) {
       // Optional: mehrere leere Zeilen am Stück verlangen
@@ -189,19 +244,30 @@ function findFirstFreeRow(ws, maxCols = 150, consecutiveEmpty = 1) {
   return last + 1;
 }
 
-function isRowEmpty(ws, r, maxCols) {
+function isRowEmpty(ws, r, maxCols = 150) {
   const row = ws.getRow(r);
   for (let c = 1; c <= maxCols; c++) {
-    const cell = row.getCell(c);
-    const val = cell?.value;
-    if (val !== null && val !== undefined && String(val).trim() !== '') {
-      return false;
-    }
+    const v = cellToString(row.getCell(c)?.value);
+    if (v) return false;
   }
   return true;
 }
 
-// ——— HTTP-Handler ———
+function cellToString(v) {
+  if (v == null) return '';
+  if (typeof v === 'object') {
+    if (v.text) return String(v.text).trim();                // Plain/RichText
+    if (v.richText && Array.isArray(v.richText)) {
+      return v.richText.map(rt => rt.text).join('').trim();
+    }
+    if (v.result != null) return String(v.result).trim();    // Formelergebnis
+    return String(v).trim();
+  }
+  return String(v).trim();
+}
+
+/* --------------------------------- Handler ------------------------------------ */
+
 export default async function handler(req, res) {
   try {
     if (req.method !== 'POST') {
@@ -224,10 +290,10 @@ export default async function handler(req, res) {
     // 1) Mapping einmalig aufbauen
     const mapping = buildColumnMapping(codebook, rows[0]);
 
-    // 2) Persona-Rows → Template-Rows (Keys = raw-Spalten)
+    // 2) Persona-Rows → Template-Rows (Keys = raw-Spaltennamen aus Template)
     const mappedRows = rows.map(r => buildTemplateRow(r, mapping));
 
-    // 3) Preview-Modus (nur Mapping prüfen, keine Datei schreiben)
+    // 3) Preview-Modus: nur Mapping prüfen
     if (String(req.query?.preview ?? "") === "1") {
       return res.status(200).json({
         preview: {
