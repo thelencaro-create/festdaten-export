@@ -5,9 +5,10 @@
 // - Q10-Duplikate → 1.=Q10_Marke, 2.=Q10_Marke_Andere
 // - Sonderregel: wenn Q10_Marke !== "10" → Q10_Marke_Andere = ""
 // - Preview (?preview=1) zeigt columns/firstRow/count (ohne XLSX-Schreiben)
-// - Writer liest die bestehende Kopfzeile (keine neue Header-Zeile), findet erste leere Datenzeile
-// - "No."/ "Anzahl"/ "Nr" wird erkannt und 1..N durchnummeriert
-// - NEU: getValueForHeader() matcht Header → mappedRows über 3 Stufen (exakt, Heuristik, normalisiert)
+// - Writer: liest Header über Scoring oder fällt auf Codebook-Reihenfolge zurück
+// - "No./Anzahl/Nr" wird erkannt und 1..N durchnummeriert
+
+/* -------------------------- Normalisierung & Heuristik -------------------------- */
 
 function normalize(s) {
   return String(s || "")
@@ -122,44 +123,69 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
   const ws = workbook.worksheets[0] || workbook.addWorksheet('Daten');
 
   // 1) Start der Daten (erste vollständig leere Zeile)
-  const startRow = findFirstFreeRow(ws, 300, 1);
-  // Optional Abstand: const startRow = findFirstFreeRow(ws, 300, 1) + 1;
+  let startRow = findFirstFreeRow(ws, 300, 1);
+  // Optional Abstand: startRow += 1;
 
-  // 2) Kopfzeile: letzte "inhaltstarke" Zeile darüber
-  const headerRowIdx = findHeaderRowAbove(ws, startRow - 1, 300);
-  if (!headerRowIdx) throw new Error('Kopfzeile im Template nicht gefunden – bitte prüfen.');
+  // 2) Kopfzeile mit Scoring finden (beste Übereinstimmung mit Codebook-Variablen)
+  const codebookNorm = new Set(
+    rows.length ? Object.keys(rows[0]).map(k => normalize(k)) : []
+  );
+  const headerRowIdx = findBestHeaderRow(ws, startRow - 1, codebookNorm, 400);
 
-  const header = readHeaderCells(ws, headerRowIdx, 300); // [{col, raw, norm}, ...]
-  if (!header.length) throw new Error('Leere Kopfzeile erkannt – bitte Template prüfen.');
+  // 3) Wenn wir eine gute Kopfzeile haben → spaltenexakt unter Header schreiben
+  if (headerRowIdx) {
+    const header = readHeaderCells(ws, headerRowIdx, 400); // [{col, raw, norm}, ...]
+    const noCol = findNoColumn(header) || 1;
 
-  // 3) "No."-Spalte finden (oder 1)
-  const noCol = findNoColumn(header) || 1;
+    let r = startRow;
+    for (let i = 0; i < rows.length; i++) {
+      const obj = rows[i];                 // <- mappedRows (Keys: Codebook-raw)
+      const personaKeys = new Set(Object.keys(obj));
+      const row = ws.getRow(r);
 
-  // 4) Daten schreiben – KEINE neue Headerzeile
-  let r = startRow;
-  for (let i = 0; i < rows.length; i++) {
-    const obj = rows[i];                 // <- mappedRows (Keys: Codebook-raw)
-    const personaKeys = new Set(Object.keys(obj));
-    const row = ws.getRow(r);
+      // Laufende Nummer in "No."-Spalte
+      row.getCell(noCol).value = i + 1;
 
-    // 4a) Laufende Nummer
-    row.getCell(noCol).value = i + 1;
-
-    // 4b) Für jede bestehende Kopfspalte passenden Wert finden & schreiben
-    for (const h of header) {
-      if (!h.raw) continue;
-      if (isNoLike(h.norm)) continue;    // "No." nicht aus Persona überschreiben
-
-      const v = getValueForHeader(obj, h, personaKeys);
-      if (v !== undefined && v !== null && v !== '') {
-        row.getCell(h.col).value = String(v);
-      } else {
-        // leer lassen
+      // Für jede Kopfspalte den passenden Wert finden (exakt → Heuristik → normalisiert)
+      for (const h of header) {
+        if (!h.raw) continue;
+        if (isNoLike(h.norm)) continue;
+        const v = getValueForHeader(obj, h, personaKeys);
+        if (v !== undefined && v !== null && v !== '') {
+          row.getCell(h.col).value = String(v);
+        }
       }
-    }
 
-    row.commit();
-    r++;
+      row.commit();
+      r++;
+    }
+  } else {
+    // 4) Fallback: Kein verlässlicher Header gefunden
+    //    → Schreibe No. in Spalte A, alle Variablen in Codebook-Reihenfolge ab Spalte B
+    const columnsOrder = Array.from(
+      rows.reduce((set, r) => { Object.keys(r).forEach(k => set.add(k)); return set; }, new Set())
+    );
+    const startCol = 2;  // B
+    let r = startRow;
+
+    for (let i = 0; i < rows.length; i++) {
+      const obj = rows[i];
+      const row = ws.getRow(r);
+
+      // No. in A
+      row.getCell(1).value = i + 1;
+
+      // Daten ab B in Codebook-Reihenfolge
+      columnsOrder.forEach((key, idx) => {
+        const v = obj[key];
+        if (v !== undefined && v !== null && v !== '') {
+          row.getCell(startCol + idx).value = String(v);
+        }
+      });
+
+      row.commit();
+      r++;
+    }
   }
 
   // 5) QA in 2. Sheet (optional)
@@ -179,29 +205,48 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
 
 /* ----------------------------- Writer-Helfer ---------------------------------- */
 
-// NEU: Smarte Wertefindung für einen Header (exakt → Heuristik → normalisiert)
+// Header passend befüllen (exakt → Heuristik → normalisiert)
 function getValueForHeader(obj, headerCell, personaKeys) {
   const raw = headerCell.raw;
   const norm = headerCell.norm;
 
   // 1) exakter Headertitel
-  if (obj.hasOwnProperty(raw) && obj[raw] != null && obj[raw] !== '') {
-    return obj[raw];
-  }
+  if (obj.hasOwnProperty(raw) && obj[raw] != null && obj[raw] !== '') return obj[raw];
 
   // 2) Heuristischer Var-Key
   const varKey = guessVarForColumn(raw, personaKeys);
-  if (varKey && obj.hasOwnProperty(varKey) && obj[varKey] != null && obj[varKey] !== '') {
-    return obj[varKey];
-  }
+  if (varKey && obj.hasOwnProperty(varKey) && obj[varKey] != null && obj[varKey] !== '') return obj[varKey];
 
   // 3) Normalisierte Übereinstimmung
   const match = Object.keys(obj).find(k => normalize(k) === norm);
-  if (match && obj[match] != null && obj[match] !== '') {
-    return obj[match];
+  if (match && obj[match] != null && obj[match] !== '') return obj[match];
+
+  return '';
+}
+
+function findBestHeaderRow(ws, fromRow, codebookNormSet, maxCols = 200, window = 50) {
+  // Suche bis zu 'window' Zeilen oberhalb von fromRow die Zeile mit bester Übereinstimmung
+  // Score: Anzahl Zellen in der Zeile, deren normalize() in codebookNormSet enthalten ist,
+  // plus Bonus für No./Anzahl/Nr.
+  let best = { row: null, score: -1 };
+
+  const start = Math.max(1, fromRow - window);
+  for (let r = fromRow; r >= start; r--) {
+    let score = 0, seenAny = false;
+    const row = ws.getRow(r);
+    for (let c = 1; c <= maxCols; c++) {
+      const txt = cellToString(row.getCell(c)?.value);
+      if (!txt) continue;
+      seenAny = true;
+      const norm = normalize(txt);
+      if (codebookNormSet.has(norm)) score += 2;       // starker Treffer
+      if (isNoLike(norm))            score += 1;       // No./Anzahl
+    }
+    if (seenAny && score > best.score) best = { row: r, score };
   }
 
-  return ''; // nichts Passendes → leer lassen
+  // Mindestscore (3) verlangen, um "Legenden"-Zeilen zu vermeiden
+  return best.score >= 3 ? best.row : null;
 }
 
 function findHeaderRowAbove(ws, fromRow, maxCols = 150) {
