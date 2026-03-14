@@ -7,8 +7,7 @@
 // - Preview (?preview=1) zeigt columns/firstRow/count (ohne XLSX-Schreiben)
 // - Writer liest die bestehende Kopfzeile (keine neue Header-Zeile), findet erste leere Datenzeile
 // - "No."/ "Anzahl"/ "Nr" wird erkannt und 1..N durchnummeriert
-
-/* -------------------------- Normalisierung & Heuristik -------------------------- */
+// - NEU: getValueForHeader() matcht Header → mappedRows über 3 Stufen (exakt, Heuristik, normalisiert)
 
 function normalize(s) {
   return String(s || "")
@@ -23,9 +22,11 @@ function guessVarForColumn(rawName, personaKeys) {
   const col = normalize(rawName);
 
   // 1) Exakte/normalisierte Übereinstimmung mit vorhandenen Persona-Keys
-  if (personaKeys.has(rawName)) return rawName;
-  const byNorm = [...personaKeys].find(k => normalize(k) === col);
-  if (byNorm) return byNorm;
+  if (personaKeys?.has?.(rawName)) return rawName;
+  if (personaKeys) {
+    const byNorm = [...personaKeys].find(k => normalize(k) === col);
+    if (byNorm) return byNorm;
+  }
 
   // 2) Häufige Familien/Synonyme
   if (col.includes("q10") && (col.includes("andere") || col.includes("andern") || col.includes("other"))) {
@@ -51,7 +52,6 @@ function guessVarForColumn(rawName, personaKeys) {
 }
 
 function buildColumnMapping(codebook, samplePersonaRow) {
-  // Spalten aus dem Codebook: bevorzugt column_order_raw, sonst variables[].raw/var
   const columns =
     Array.isArray(codebook?.column_order_raw) && codebook.column_order_raw.length
       ? [...codebook.column_order_raw]
@@ -61,14 +61,13 @@ function buildColumnMapping(codebook, samplePersonaRow) {
 
   const personaKeys = new Set(Object.keys(samplePersonaRow || {}));
 
-  // 1) Basismapping
   const mapping = new Map(); // raw -> varKey|null
   for (const raw of columns) {
     mapping.set(raw, guessVarForColumn(raw, personaKeys));
   }
 
-  // 2) Duplikate nach "Basis" clustern
-  const groups = new Map(); // base -> raw[]
+  // Duplikate gruppieren
+  const groups = new Map();
   for (const raw of columns) {
     const nk = normalize(raw);
     const base =
@@ -81,7 +80,7 @@ function buildColumnMapping(codebook, samplePersonaRow) {
     groups.get(base).push(raw);
   }
 
-  // Q10: genau zwei Spalten -> 1.=Marke, 2.=Marke_Andere (falls noch nicht gesetzt)
+  // Q10: genau 2 Spalten → 1. Marke, 2. Andere
   if (groups.has("Q10")) {
     const q10cols = groups.get("Q10");
     if (q10cols.length === 2) {
@@ -91,7 +90,7 @@ function buildColumnMapping(codebook, samplePersonaRow) {
     }
   }
 
-  return mapping; // Map<rawColumn, varKey|null>
+  return mapping;
 }
 
 function buildTemplateRow(personaRow, mapping) {
@@ -116,54 +115,46 @@ function buildTemplateRow(personaRow, mapping) {
 async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl) {
   const ExcelJS = (await import('exceljs')).default;
 
-  // 1) Vorlage laden
   const tplBuf = Buffer.from(templateBase64, 'base64');
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(tplBuf);
 
-  // 2) Erstes Worksheet (kein fixer Name nötig)
   const ws = workbook.worksheets[0] || workbook.addWorksheet('Daten');
 
-  // 3) Erste vollständig leere Zeile = Datenstart (unterhalb Fragen/Antwortblock)
+  // 1) Start der Daten (erste vollständig leere Zeile)
   const startRow = findFirstFreeRow(ws, 300, 1);
-  // Falls du bewusst 1 Leerzeile Abstand wünschst:  const startRow = findFirstFreeRow(ws, 300, 1) + 1;
+  // Optional Abstand: const startRow = findFirstFreeRow(ws, 300, 1) + 1;
 
-  // 4) Kopfzeile ermitteln: letzte "inhaltstarke" Zeile darüber
+  // 2) Kopfzeile: letzte "inhaltstarke" Zeile darüber
   const headerRowIdx = findHeaderRowAbove(ws, startRow - 1, 300);
   if (!headerRowIdx) throw new Error('Kopfzeile im Template nicht gefunden – bitte prüfen.');
 
   const header = readHeaderCells(ws, headerRowIdx, 300); // [{col, raw, norm}, ...]
   if (!header.length) throw new Error('Leere Kopfzeile erkannt – bitte Template prüfen.');
 
-  // 5) "No."-Spalte erkennen (oder Default Spalte 1)
+  // 3) "No."-Spalte finden (oder 1)
   const noCol = findNoColumn(header) || 1;
 
-  // 6) Rohspaltennamen → Spaltenindex abbilden
-  const indexByRaw = new Map();
-  for (const h of header) {
-    if (!h.raw) continue;
-    indexByRaw.set(h.raw, h.col);
-  }
-
-  // 7) Daten schreiben (keine neue Kopfzeile!)
+  // 4) Daten schreiben – KEINE neue Headerzeile
   let r = startRow;
   for (let i = 0; i < rows.length; i++) {
-    const obj = rows[i]; // <- bereits "mappedRows"
+    const obj = rows[i];                 // <- mappedRows (Keys: Codebook-raw)
+    const personaKeys = new Set(Object.keys(obj));
     const row = ws.getRow(r);
 
-    // 7a) Laufende Nummer
+    // 4a) Laufende Nummer
     row.getCell(noCol).value = i + 1;
 
-    // 7b) Spalten exakt per vorhandener Header-Beschriftung befüllen
+    // 4b) Für jede bestehende Kopfspalte passenden Wert finden & schreiben
     for (const h of header) {
       if (!h.raw) continue;
-      if (isNoLike(h.norm)) continue; // "No." nicht überschreiben
+      if (isNoLike(h.norm)) continue;    // "No." nicht aus Persona überschreiben
 
-      const v = obj[h.raw];
-      if (v !== undefined && v !== null) {
+      const v = getValueForHeader(obj, h, personaKeys);
+      if (v !== undefined && v !== null && v !== '') {
         row.getCell(h.col).value = String(v);
       } else {
-        // bewusst leer lassen → kein Shift/Einschub
+        // leer lassen
       }
     }
 
@@ -171,7 +162,7 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
     r++;
   }
 
-  // 8) Optional: QA in 2. Sheet
+  // 5) QA in 2. Sheet (optional)
   if (qa && typeof qa === 'object' && Object.keys(qa).length) {
     const qaWs = workbook.addWorksheet('QA');
     let i = 1;
@@ -182,15 +173,38 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
     }
   }
 
-  // 9) → Base64 zurückgeben
   const out = await workbook.xlsx.writeBuffer();
   return Buffer.from(out).toString('base64');
 }
 
 /* ----------------------------- Writer-Helfer ---------------------------------- */
 
+// NEU: Smarte Wertefindung für einen Header (exakt → Heuristik → normalisiert)
+function getValueForHeader(obj, headerCell, personaKeys) {
+  const raw = headerCell.raw;
+  const norm = headerCell.norm;
+
+  // 1) exakter Headertitel
+  if (obj.hasOwnProperty(raw) && obj[raw] != null && obj[raw] !== '') {
+    return obj[raw];
+  }
+
+  // 2) Heuristischer Var-Key
+  const varKey = guessVarForColumn(raw, personaKeys);
+  if (varKey && obj.hasOwnProperty(varKey) && obj[varKey] != null && obj[varKey] !== '') {
+    return obj[varKey];
+  }
+
+  // 3) Normalisierte Übereinstimmung
+  const match = Object.keys(obj).find(k => normalize(k) === norm);
+  if (match && obj[match] != null && obj[match] !== '') {
+    return obj[match];
+  }
+
+  return ''; // nichts Passendes → leer lassen
+}
+
 function findHeaderRowAbove(ws, fromRow, maxCols = 150) {
-  // Nimm die letzte Zeile vor startRow, die "deutlich" Inhalt hat (>= 3 befüllte Zellen)
   for (let r = fromRow; r >= 1; r--) {
     let filled = 0;
     for (let c = 1; c <= maxCols; c++) {
@@ -219,7 +233,6 @@ function findNoColumn(headerCells) {
   }
   return null;
 }
-
 function isNoLike(normText) {
   return normText === 'no' ||
          normText.startsWith('no_') ||
@@ -230,10 +243,9 @@ function isNoLike(normText) {
 
 function findFirstFreeRow(ws, maxCols = 150, consecutiveEmpty = 1) {
   const last = ws.lastRow ? ws.lastRow.number : 1;
-  const scanTo = last + 200; // etwas Puffer
+  const scanTo = last + 200;
   for (let r = 1; r <= scanTo; r++) {
     if (isRowEmpty(ws, r, maxCols)) {
-      // Optional: mehrere leere Zeilen am Stück verlangen
       let ok = true;
       for (let k = 1; k < consecutiveEmpty; k++) {
         if (!isRowEmpty(ws, r + k, maxCols)) { ok = false; break; }
@@ -243,7 +255,6 @@ function findFirstFreeRow(ws, maxCols = 150, consecutiveEmpty = 1) {
   }
   return last + 1;
 }
-
 function isRowEmpty(ws, r, maxCols = 150) {
   const row = ws.getRow(r);
   for (let c = 1; c <= maxCols; c++) {
@@ -252,15 +263,14 @@ function isRowEmpty(ws, r, maxCols = 150) {
   }
   return true;
 }
-
 function cellToString(v) {
   if (v == null) return '';
   if (typeof v === 'object') {
-    if (v.text) return String(v.text).trim();                // Plain/RichText
+    if (v.text) return String(v.text).trim();
     if (v.richText && Array.isArray(v.richText)) {
       return v.richText.map(rt => rt.text).join('').trim();
     }
-    if (v.result != null) return String(v.result).trim();    // Formelergebnis
+    if (v.result != null) return String(v.result).trim();
     return String(v).trim();
   }
   return String(v).trim();
@@ -287,13 +297,13 @@ export default async function handler(req, res) {
     if (!Array.isArray(rows) || !rows.length) return res.status(400).json({ error: 'rows fehlt/leer' });
     if (!codebook) return res.status(400).json({ error: 'codebook fehlt' });
 
-    // 1) Mapping einmalig aufbauen
+    // 1) Mapping
     const mapping = buildColumnMapping(codebook, rows[0]);
 
-    // 2) Persona-Rows → Template-Rows (Keys = raw-Spaltennamen aus Template)
+    // 2) mappedRows (Keys = Codebook-raw)
     const mappedRows = rows.map(r => buildTemplateRow(r, mapping));
 
-    // 3) Preview-Modus: nur Mapping prüfen
+    // 3) Preview
     if (String(req.query?.preview ?? "") === "1") {
       return res.status(200).json({
         preview: {
@@ -304,7 +314,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // 4) XLSX schreiben
+    // 4) Schreiben
     const fileBase64 = await buildXlsxFromTemplate(
       templateBase64,
       mappedRows,
