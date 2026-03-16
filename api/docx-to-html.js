@@ -1,4 +1,3 @@
-// api/docx-to-html.js
 import mammoth from "mammoth";
 
 export default async function handler(req, res) {
@@ -8,7 +7,6 @@ export default async function handler(req, res) {
     }
 
     const { fileBase64 } = req.body;
-
     if (!fileBase64) {
       return res.status(400).json({ error: "No DOCX file provided" });
     }
@@ -17,9 +15,9 @@ export default async function handler(req, res) {
     const buffer = Buffer.from(clean, "base64");
 
     const result = await mammoth.convertToHtml({ buffer });
-
     res.status(200).json({ html: result.value });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 }
+``
