@@ -5,6 +5,7 @@
   "type": "module",
   "dependencies": {
     "exceljs": "^4.4.0",
-    "mammoth": "^1.11.0"
+    "mammoth": "^1.11.0",
+    "formidable": "^3.5.4"
   }
 }
