@@ -1,26 +1,54 @@
+// api/docx-to-html.js
+import formidable from "formidable";
+import fs from "fs";
 import mammoth from "mammoth";
+
+export const config = {
+  api: {
+    bodyParser: false, // WICHTIG: multipart selbst parsen
+  },
+};
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  let buffer = null;
+  // multipart/form-data Parser
+  const form = formidable({
+    multiples: false,
+    keepExtensions: false,
+  });
 
-  // 1) Multipart (Send Binary Data aus n8n)
-  if (req.files?.file?.[0]?.buffer) {
-    buffer = req.files.file[0].buffer;
+  try {
+    const { files } = await new Promise((resolve, reject) => {
+      form.parse(req, (err, fields, files) => {
+        if (err) reject(err);
+        else resolve({ fields, files });
+      });
+    });
+
+    // n8n sendet das File im Field 'file'
+    const uploadedFile = files.file;
+
+    if (!uploadedFile) {
+      return res.status(400).json({ error: "No DOCX file provided" });
+    }
+
+    // formidable liefert file.filepath = temp Pfad
+    const buffer = fs.readFileSync(uploadedFile.filepath);
+
+    // DOCX → HTML
+    const result = await mammoth.convertToHtml({ buffer });
+
+    return res.status(200).json({
+      html: result.value,
+      messages: result.messages ?? [],
+    });
+  } catch (err) {
+    return res.status(500).json({
+      error: "Upload or conversion failed",
+      details: err.message,
+    });
   }
-
-  // 2) JSON body mit Base64
-  if (!buffer && req.body?.fileBase64) {
-    buffer = Buffer.from(req.body.fileBase64, "base64");
-  }
-
-  if (!buffer) {
-    return res.status(400).json({ error: "No DOCX file provided" });
-  }
-
-  const result = await mammoth.convertToHtml({ buffer });
-  return res.status(200).json({ html: result.value });
 }
