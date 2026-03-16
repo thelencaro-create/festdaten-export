@@ -3,15 +3,13 @@ import formidable from "formidable";
 import fs from "fs";
 import mammoth from "mammoth";
 
-// Für multipart dürfen wir Vercels Body-Parser NICHT nutzen.
-// Wir parsen multipart selbst, JSON lesen wir als Raw-Stream.
 export const config = {
   api: {
-    bodyParser: false,
+    bodyParser: false, // Wichtig: multipart nicht automatisch parsen!
   },
 };
 
-// Hilfsfunktion: kompletten Request-Body als String lesen (für JSON-Uploads)
+// Hilfsfunktion, um JSON-Body einzulesen (wenn Content-Type application/json)
 async function readRawBody(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -19,18 +17,18 @@ async function readRawBody(req) {
 }
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
-
   try {
-    const ctype = String(req.headers["content-type"] || "").toLowerCase();
+    if (req.method !== "POST") {
+      return res.status(405).json({ error: "Method not allowed" });
+    }
+
+    const contentType = req.headers["content-type"] || "";
 
     let buffer = null;
 
-    // === Pfad 1: multipart/form-data (n8n "n8n Binary File") ===
-    if (ctype.includes("multipart/form-data")) {
-      const form = formidable({ multiples: false, keepExtensions: false });
+    // ========== VARIANTE A: multipart/form-data (n8n Binary File) ==========
+    if (contentType.includes("multipart/form-data")) {
+      const form = formidable({ multiples: false });
 
       const { files } = await new Promise((resolve, reject) => {
         form.parse(req, (err, fields, files) => {
@@ -39,34 +37,34 @@ export default async function handler(req, res) {
         });
       });
 
-      // n8n sendet das File im Feldnamen "file" (der Node kümmert sich darum)
-      const f = files?.file;
-      const fileObj = Array.isArray(f) ? f[0] : f;
+      const uploaded = files.file;
+      const fileObj = Array.isArray(uploaded) ? uploaded[0] : uploaded;
 
       if (!fileObj?.filepath) {
-        return res.status(400).json({ error: "No DOCX file provided (multipart)" });
+        return res.status(400).json({ error: "No DOCX file received (multipart)" });
       }
+
       buffer = fs.readFileSync(fileObj.filepath);
     }
 
-    // === Pfad 2: JSON-Body mit { fileBase64: "..." } ===
-    else if (ctype.includes("application/json")) {
+    // ========== VARIANTE B: JSON mit Base64 ==========
+    else if (contentType.includes("application/json")) {
       const raw = await readRawBody(req);
-      let body = {};
-      try { body = JSON.parse(raw || "{}"); } catch {}
-      const fileBase64 = String(body.fileBase64 || "").trim();
-      if (!fileBase64) {
-        return res.status(400).json({ error: "No DOCX file provided (json)" });
+      const body = JSON.parse(raw || "{}");
+
+      if (!body.fileBase64) {
+        return res.status(400).json({ error: "No DOCX file received (json)" });
       }
-      const clean = fileBase64.includes("base64,")
-        ? fileBase64.split("base64,").pop()
-        : fileBase64;
-      buffer = Buffer.from(clean, "base64");
+
+      const base64 = body.fileBase64.replace(/^data:.*;base64,/, "");
+      buffer = Buffer.from(base64, "base64");
     }
 
-    // Kein passendes Upload-Format gefunden
+    // Kein Buffer? → kein gültiger Upload
     if (!buffer) {
-      return res.status(415).json({ error: "Unsupported media type. Use multipart/form-data or JSON with fileBase64." });
+      return res.status(415).json({
+        error: "Unsupported content type. Use multipart/form-data or JSON with fileBase64.",
+      });
     }
 
     // DOCX → HTML
@@ -79,8 +77,8 @@ export default async function handler(req, res) {
   } catch (err) {
     console.error("docx-to-html error:", err);
     return res.status(500).json({
-      error: "Upload or conversion failed",
-      details: String(err?.message ?? err),
+      error: "Server crashed",
+      details: err.message,
     });
   }
 }
