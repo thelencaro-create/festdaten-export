@@ -1,20 +1,23 @@
 // api/docx-to-html.js
+
+export const config = {
+  runtime: "nodejs18.x"   // <<< WICHTIG: verhindert EDGE-Runtime!
+};
+
 import formidable from "formidable";
 import fs from "fs";
 import mammoth from "mammoth";
 
-export const config = {
-  api: {
-    bodyParser: false, // Wichtig: multipart nicht automatisch parsen!
-  },
-};
-
-// Hilfsfunktion, um JSON-Body einzulesen (wenn Content-Type application/json)
+// Raw JSON Body Reader (für JSON Uploads)
 async function readRawBody(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   return Buffer.concat(chunks).toString("utf8");
 }
+
+export const api = {
+  bodyParser: false,
+};
 
 export default async function handler(req, res) {
   try {
@@ -23,7 +26,6 @@ export default async function handler(req, res) {
     }
 
     const contentType = req.headers["content-type"] || "";
-
     let buffer = null;
 
     // ========== VARIANTE A: multipart/form-data (n8n Binary File) ==========
@@ -47,7 +49,7 @@ export default async function handler(req, res) {
       buffer = fs.readFileSync(fileObj.filepath);
     }
 
-    // ========== VARIANTE B: JSON mit Base64 ==========
+    // ========== VARIANTE B: JSON Upload (fileBase64) ==========
     else if (contentType.includes("application/json")) {
       const raw = await readRawBody(req);
       const body = JSON.parse(raw || "{}");
@@ -60,10 +62,9 @@ export default async function handler(req, res) {
       buffer = Buffer.from(base64, "base64");
     }
 
-    // Kein Buffer? → kein gültiger Upload
     if (!buffer) {
-      return res.status(415).json({
-        error: "Unsupported content type. Use multipart/form-data or JSON with fileBase64.",
+      return res.status(400).json({
+        error: "Unsupported content type (send multipart/form-data or JSON with fileBase64)."
       });
     }
 
@@ -74,6 +75,7 @@ export default async function handler(req, res) {
       html: result.value,
       messages: result.messages ?? [],
     });
+
   } catch (err) {
     console.error("docx-to-html error:", err);
     return res.status(500).json({
