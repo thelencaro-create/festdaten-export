@@ -3,11 +3,6 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "scripts": {
-    "dev": "vercel dev",
-    "build": "echo \"Vercel builds serverless functions automatically\"",
-    "start": "vercel dev"
-  },
   "dependencies": {
     "exceljs": "^4.4.0",
     "mammoth": "^1.11.0"
