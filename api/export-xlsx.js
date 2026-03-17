@@ -1,7 +1,21 @@
-// api/export-xlsx.js
-// Robust: Mapping beliebiger Template-Header → Persona-Variablen + Schreiben in die Vorlage.
+// --------------------------------------------------------------
+// VERCEL API ROUTE CONFIG – WICHTIG FÜR GROßE JSON-BODIES!
+// Erhöht das Body-Parser-Limit von 1 MB → 10 MB.
+// --------------------------------------------------------------
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: "10mb",
+    },
+    // optional – aber oft sinnvoll:
+    // maxDuration: 10
+  }
+};
 
-// ---------------- Normalisierung & Heuristik ----------------
+
+// --------------------------------------------------------------
+// Robust: Mapping beliebiger Template-Header → Persona-Variablen
+// --------------------------------------------------------------
 
 function normalize(s) {
   return String(s || "")
@@ -14,14 +28,12 @@ function normalize(s) {
 function guessVarForColumn(rawName, personaKeys) {
   const col = normalize(rawName);
 
-  // 1) exakter/normalisierter Treffer
   if (personaKeys?.has?.(rawName)) return rawName;
   if (personaKeys) {
     const byNorm = [...personaKeys].find(k => normalize(k) === col);
     if (byNorm) return byNorm;
   }
 
-  // 2) Heuristiken
   if (col.includes("q10") && (col.includes("andere") || col.includes("andern") || col.includes("other")))
     return "Q10_Marke_Andere";
   if (col.includes("q10")) return "Q10_Marke";
@@ -38,6 +50,7 @@ function guessVarForColumn(rawName, personaKeys) {
   if (col.includes("age") || col.includes("alter") || col.includes("altersgruppe")) return "Q3_Age";
 
   if (col === "no" || col.includes("anzahl") || col === "nr") return "No";
+
   return null;
 }
 
@@ -51,10 +64,9 @@ function buildColumnMapping(codebook, samplePersonaRow) {
 
   const personaKeys = new Set(Object.keys(samplePersonaRow || {}));
 
-  const mapping = new Map(); // raw -> varKey|null
+  const mapping = new Map();
   for (const raw of columns) mapping.set(raw, guessVarForColumn(raw, personaKeys));
 
-  // Duplikat-Gruppen
   const groups = new Map();
   for (const raw of columns) {
     const nk = normalize(raw);
@@ -67,7 +79,6 @@ function buildColumnMapping(codebook, samplePersonaRow) {
     groups.get(base).push(raw);
   }
 
-  // Q10: 2 Spalten → 1.=Marke, 2.=Andere
   if (groups.has("Q10")) {
     const q10cols = groups.get("Q10");
     if (q10cols.length === 2) {
@@ -81,7 +92,7 @@ function buildColumnMapping(codebook, samplePersonaRow) {
 
 function buildTemplateRow(personaRow, mapping) {
   const row = { ...personaRow };
-  if (String(row["Q10_Marke"] ?? "") !== "10") row["Q10_Marke_Andere"] = ""; // Sonderregel
+  if (String(row["Q10_Marke"] ?? "") !== "10") row["Q10_Marke_Andere"] = "";
 
   const out = {};
   for (const [raw, vKey] of mapping.entries()) {
@@ -92,9 +103,10 @@ function buildTemplateRow(personaRow, mapping) {
   return out;
 }
 
-// ---------------- Robustes Decoding & XLSX-Writer ----------------
+// --------------------------------------------------------------
+// XLSX DECODE + WRITE
+// --------------------------------------------------------------
 
-// Entfernt Daten-URL-Präfixe und prüft ZIP-"PK"
 function toXlsxBuffer(b64) {
   const s = String(b64 || '').trim();
   const clean = s.includes('base64,') ? s.split('base64,').pop() : s;
@@ -162,7 +174,6 @@ function findFirstFreeRow(ws, maxCols = 150, consecutiveEmpty = 1) {
   return last + 1;
 }
 
-// Score-basierte Suche der echten Kopfzeile (unterhalb von Legenden/Skalen)
 function findBestHeaderRow(ws, fromRow, codebookNormSet, maxCols = 200, window = 60) {
   let best = { row: null, score: -1 };
   const start = Math.max(1, fromRow - window);
@@ -182,7 +193,6 @@ function findBestHeaderRow(ws, fromRow, codebookNormSet, maxCols = 200, window =
   return best.score >= 3 ? best.row : null;
 }
 
-// Smarte Wertefindung (exakt → heuristisch → normalisiert)
 function getValueForHeader(obj, headerCell, personaKeys) {
   const raw = headerCell.raw;
   const norm = headerCell.norm;
@@ -199,17 +209,13 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
   const ExcelJS = (await import('exceljs')).default;
 
   const tplBuf = toXlsxBuffer(templateBase64);
-  console.log('tplLen=%d rows=%d magic=%s', tplBuf.length, rows.length, tplBuf.slice(0,2).toString());
 
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(tplBuf);
 
   const ws = workbook.worksheets[0] || workbook.addWorksheet('Daten');
-
-  // Start der Daten (erste vollständig leere Zeile)
   const startRow = findFirstFreeRow(ws, 300, 1);
 
-  // Header anhand Codebook-Normalformen scoren
   const codebookNorm = new Set(
     rows.length ? Object.keys(rows[0]).map(k => normalize(k)) : []
   );
@@ -217,10 +223,11 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
 
   if (headerRowIdx) {
     const header = readHeaderCells(ws, headerRowIdx, 400);
-    const noCol = (function findNo(headerCells){
-      for (const h of headerCells) if (isNoLike(h.norm)) return h.col;
+
+    const noCol = (() => {
+      for (const h of header) if (isNoLike(h.norm)) return h.col;
       return 1;
-    })(header);
+    })();
 
     let r = startRow;
     for (let i = 0; i < rows.length; i++) {
@@ -228,10 +235,8 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
       const personaKeys = new Set(Object.keys(obj));
       const row = ws.getRow(r);
 
-      // No. fortlaufend
       row.getCell(noCol).value = i + 1;
 
-      // Werte spaltenexakt
       for (const h of header) {
         if (!h.raw || isNoLike(h.norm)) continue;
         const v = getValueForHeader(obj, h, personaKeys);
@@ -241,7 +246,6 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
       r++;
     }
   } else {
-    // Fallback: Ohne verlässlichen Header → No. in A, Spalten ab B in Codebook-Reihenfolge
     const cols = Array.from(
       rows.reduce((set, r) => { Object.keys(r).forEach(k => set.add(k)); return set; }, new Set())
     );
@@ -249,7 +253,7 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
     for (let i = 0; i < rows.length; i++) {
       const obj = rows[i];
       const row = ws.getRow(r);
-      row.getCell(1).value = i + 1; // No. in A
+      row.getCell(1).value = i + 1;
       cols.forEach((key, idx) => {
         const v = obj[key];
         if (v !== undefined && v !== null && v !== '') row.getCell(2 + idx).value = String(v);
@@ -259,7 +263,6 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
     }
   }
 
-  // QA-Sheet (optional)
   if (qa && typeof qa === 'object' && Object.keys(qa).length) {
     const qaWs = workbook.addWorksheet('QA');
     let i = 1;
@@ -274,11 +277,14 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
   return Buffer.from(out).toString('base64');
 }
 
-// ---------------- HTTP-Handler ----------------
+// --------------------------------------------------------------
+// HTTP HANDLER
+// --------------------------------------------------------------
 
 export default async function handler(req, res) {
   try {
-    if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+    if (req.method !== 'POST')
+      return res.status(405).json({ error: 'Method not allowed' });
 
     const {
       templateBase64 = '',
@@ -289,15 +295,18 @@ export default async function handler(req, res) {
       codebook = null
     } = req.body || {};
 
-    if (!templateBase64) return res.status(400).json({ error: 'templateBase64 fehlt' });
-    if (!Array.isArray(rows) || !rows.length) return res.status(400).json({ error: 'rows fehlt/leer' });
-    if (!codebook) return res.status(400).json({ error: 'codebook fehlt' });
+    if (!templateBase64)
+      return res.status(400).json({ error: 'templateBase64 fehlt' });
 
-    // Mapping aufbauen → Template-Rows (Keys = raw-Spaltennamen)
+    if (!Array.isArray(rows) || !rows.length)
+      return res.status(400).json({ error: 'rows fehlt/leer' });
+
+    if (!codebook)
+      return res.status(400).json({ error: 'codebook fehlt' });
+
     const mapping = buildColumnMapping(codebook, rows[0]);
     const mappedRows = rows.map(r => buildTemplateRow(r, mapping));
 
-    // Preview-Modus
     if (String(req.query?.preview ?? "") === "1") {
       return res.status(200).json({
         preview: {
@@ -308,7 +317,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // XLSX schreiben
     const fileBase64 = await buildXlsxFromTemplate(
       templateBase64,
       mappedRows,
@@ -320,6 +328,9 @@ export default async function handler(req, res) {
     return res.status(200).json({ file: fileBase64 });
   } catch (err) {
     console.error("export-xlsx error:", err);
-    return res.status(500).json({ error: 'Server error', details: String(err?.message || err) });
+    return res.status(500).json({
+      error: 'Server error',
+      details: String(err?.message || err)
+    });
   }
 }
