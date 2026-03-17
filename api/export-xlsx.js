@@ -1,20 +1,18 @@
 // --------------------------------------------------------------
-// VERCEL API ROUTE CONFIG – WICHTIG FÜR GROßE JSON-BODIES!
-// Erhöht das Body-Parser-Limit von 1 MB → 10 MB.
+// VERCEL API ROUTE CONFIG – ERWEITERT BODY-SIZE AUF 10 MB
+// (Next.js default = 1 MB → würde große Base64-Bodies verwerfen)
 // --------------------------------------------------------------
 export const config = {
   api: {
     bodyParser: {
-      sizeLimit: "10mb",
+      sizeLimit: "10mb",   // <-- wichtig
     },
-    // optional – aber oft sinnvoll:
-    // maxDuration: 10
-  }
+  },
 };
 
 
 // --------------------------------------------------------------
-// Robust: Mapping beliebiger Template-Header → Persona-Variablen
+// Robust: Mapping beliebiger Template-Header → Persona Variablen
 // --------------------------------------------------------------
 
 function normalize(s) {
@@ -63,8 +61,8 @@ function buildColumnMapping(codebook, samplePersonaRow) {
         : [];
 
   const personaKeys = new Set(Object.keys(samplePersonaRow || {}));
-
   const mapping = new Map();
+
   for (const raw of columns) mapping.set(raw, guessVarForColumn(raw, personaKeys));
 
   const groups = new Map();
@@ -87,6 +85,7 @@ function buildColumnMapping(codebook, samplePersonaRow) {
       mapping.set(c2, mapping.get(c2) ?? "Q10_Marke_Andere");
     }
   }
+
   return mapping;
 }
 
@@ -103,6 +102,7 @@ function buildTemplateRow(personaRow, mapping) {
   return out;
 }
 
+
 // --------------------------------------------------------------
 // XLSX DECODE + WRITE
 // --------------------------------------------------------------
@@ -111,9 +111,11 @@ function toXlsxBuffer(b64) {
   const s = String(b64 || '').trim();
   const clean = s.includes('base64,') ? s.split('base64,').pop() : s;
   const buf = Buffer.from(clean, 'base64');
+
   if (buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4B) {
     throw new Error(`TemplateBase64 ist kein XLSX/ZIP (len=${buf.length}, head=${buf.slice(0,4).toString('hex')}).`);
   }
+
   return buf;
 }
 
@@ -129,11 +131,11 @@ function cellToString(v) {
 }
 
 function isNoLike(normText) {
-  return normText === 'no' ||
-         normText.startsWith('no_') ||
-         normText.includes('anzahl') ||
-         normText === 'nr' ||
-         normText.startsWith('nr_');
+  return normText === 'no'
+      || normText.startsWith('no_')
+      || normText.includes('anzahl')
+      || normText === 'nr'
+      || normText.startsWith('nr_');
 }
 
 function readHeaderCells(ws, headerRowIdx, maxCols = 150) {
@@ -150,23 +152,36 @@ function readHeaderCells(ws, headerRowIdx, maxCols = 150) {
 function findFirstFreeRow(ws, maxCols = 150, consecutiveEmpty = 1) {
   const last = ws.lastRow ? ws.lastRow.number : 1;
   const scanTo = last + 200;
+
   for (let r = 1; r <= scanTo; r++) {
     const row = ws.getRow(r);
     let any = false;
+
     for (let c = 1; c <= maxCols; c++) {
-      const val = cellToString(row.getCell(c)?.value);
-      if (val) { any = true; break; }
+      if (cellToString(row.getCell(c)?.value)) {
+        any = true;
+        break;
+      }
     }
+
     if (!any) {
       let ok = true;
+
       for (let k = 1; k < consecutiveEmpty; k++) {
         const next = ws.getRow(r + k);
         let any2 = false;
+
         for (let c = 1; c <= maxCols; c++) {
-          const val2 = cellToString(next.getCell(c)?.value);
-          if (val2) { any2 = true; break; }
+          if (cellToString(next.getCell(c)?.value)) {
+            any2 = true;
+            break;
+          }
         }
-        if (any2) { ok = false; break; }
+
+        if (any2) {
+          ok = false;
+          break;
+        }
       }
       if (ok) return r;
     }
@@ -177,19 +192,25 @@ function findFirstFreeRow(ws, maxCols = 150, consecutiveEmpty = 1) {
 function findBestHeaderRow(ws, fromRow, codebookNormSet, maxCols = 200, window = 60) {
   let best = { row: null, score: -1 };
   const start = Math.max(1, fromRow - window);
+
   for (let r = fromRow; r >= start; r--) {
     let score = 0, seenAny = false;
     const row = ws.getRow(r);
+
     for (let c = 1; c <= maxCols; c++) {
       const txt = cellToString(row.getCell(c)?.value);
       if (!txt) continue;
+
       seenAny = true;
       const norm = normalize(txt);
+
       if (codebookNormSet.has(norm)) score += 2;
-      if (isNoLike(norm))            score += 1;
+      if (isNoLike(norm)) score += 1;
     }
+
     if (seenAny && score > best.score) best = { row: r, score };
   }
+
   return best.score >= 3 ? best.row : null;
 }
 
@@ -198,10 +219,14 @@ function getValueForHeader(obj, headerCell, personaKeys) {
   const norm = headerCell.norm;
 
   if (obj.hasOwnProperty(raw) && obj[raw] != null && obj[raw] !== '') return obj[raw];
+
   const varKey = guessVarForColumn(raw, personaKeys);
-  if (varKey && obj.hasOwnProperty(varKey) && obj[varKey] != null && obj[varKey] !== '') return obj[varKey];
+  if (varKey && obj.hasOwnProperty(varKey) && obj[varKey] != null && obj[varKey] !== '')
+    return obj[varKey];
+
   const match = Object.keys(obj).find(k => normalize(k) === norm);
   if (match && obj[match] != null && obj[match] !== '') return obj[match];
+
   return '';
 }
 
@@ -209,16 +234,13 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
   const ExcelJS = (await import('exceljs')).default;
 
   const tplBuf = toXlsxBuffer(templateBase64);
-
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(tplBuf);
 
   const ws = workbook.worksheets[0] || workbook.addWorksheet('Daten');
   const startRow = findFirstFreeRow(ws, 300, 1);
 
-  const codebookNorm = new Set(
-    rows.length ? Object.keys(rows[0]).map(k => normalize(k)) : []
-  );
+  const codebookNorm = new Set(rows.length ? Object.keys(rows[0]).map(k => normalize(k)) : []);
   const headerRowIdx = findBestHeaderRow(ws, startRow - 1, codebookNorm, 400);
 
   if (headerRowIdx) {
@@ -230,6 +252,7 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
     })();
 
     let r = startRow;
+
     for (let i = 0; i < rows.length; i++) {
       const obj = rows[i];
       const personaKeys = new Set(Object.keys(obj));
@@ -242,6 +265,7 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
         const v = getValueForHeader(obj, h, personaKeys);
         if (v !== '') row.getCell(h.col).value = String(v);
       }
+
       row.commit();
       r++;
     }
@@ -249,15 +273,22 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
     const cols = Array.from(
       rows.reduce((set, r) => { Object.keys(r).forEach(k => set.add(k)); return set; }, new Set())
     );
+
     let r = startRow;
+
     for (let i = 0; i < rows.length; i++) {
       const obj = rows[i];
       const row = ws.getRow(r);
+
       row.getCell(1).value = i + 1;
+
       cols.forEach((key, idx) => {
         const v = obj[key];
-        if (v !== undefined && v !== null && v !== '') row.getCell(2 + idx).value = String(v);
+        if (v !== undefined && v !== null && v !== '') {
+          row.getCell(2 + idx).value = String(v);
+        }
       });
+
       row.commit();
       r++;
     }
@@ -266,6 +297,7 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
   if (qa && typeof qa === 'object' && Object.keys(qa).length) {
     const qaWs = workbook.addWorksheet('QA');
     let i = 1;
+
     for (const [k, v] of Object.entries(qa)) {
       qaWs.getCell(i, 1).value = k;
       qaWs.getCell(i, 2).value = (typeof v === 'object') ? JSON.stringify(v) : String(v ?? '');
@@ -276,6 +308,7 @@ async function buildXlsxFromTemplate(templateBase64, rows, qa, prefix, fallzahl)
   const out = await workbook.xlsx.writeBuffer();
   return Buffer.from(out).toString('base64');
 }
+
 
 // --------------------------------------------------------------
 // HTTP HANDLER
@@ -326,6 +359,7 @@ export default async function handler(req, res) {
     );
 
     return res.status(200).json({ file: fileBase64 });
+
   } catch (err) {
     console.error("export-xlsx error:", err);
     return res.status(500).json({
