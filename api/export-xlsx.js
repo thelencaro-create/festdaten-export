@@ -8,13 +8,9 @@ export const config = {
   }
 };
 
-/**
- * Hilfen zur robusten Header-Zuordnung (ohne das Template zu verändern):
- * - Wir lesen die echten Spaltenüberschriften aus Zeile 1 des Templates.
- * - Wir bauen ein Mapping von "Template-Header" -> "Key in rows".
- * - Exakte Übereinstimmung hat Priorität, sonst Normalisierung / Heuristiken.
- * - Startzeile = 3 (Row 1 = Header, Row 2 = Legenden).
- */
+// -------------------------
+// Helper: Normalisierung
+// -------------------------
 function normalize(s) {
   return String(s || "")
     .toLowerCase()
@@ -23,21 +19,49 @@ function normalize(s) {
     .replace(/^_|_$/g, "");
 }
 
-// Bekannte Alias-Muster von Variablennamen (Template-Header -> rows-Key)
+// Erkenne Zähl-/Index-Spalten (z. B. "Anzahl", "No.", "Nr")
+function isCountHeader(h) {
+  const n = normalize(h);
+  return n === "anzahl" || n === "no" || n === "nr" || n.startsWith("nr_");
+}
+
+// Feste Overrides: Template-Header → rows-Key
+// (inkl. Disambiguierung für doppelte Q10-Header)
+function headerOverrides() {
+  return new Map([
+    ["Q2.Gender", "Q2_Gender"],
+    ["Q3.Altersgruppe: Welcher Altersgruppe gehören Sie an?", "Q3_Age"],
+    ["Q7_Essverhalten: Wie oft verwenden Sie Frischkäse?", "Q7_Essverhalten_Frischkaese"],
+    ["Q7_Essverhalten: Wie oft verwenden Sie Gouda?", "Q7_Essverhalten_Gouda"],
+    ["Q7_Essverhalten: Wie oft verwenden Sie Butterkäse?", "Q7_Essverhalten_Butterkaese"],
+    ["Q7_Essverhalten: Wie oft verwenden Sie Camembert?", "Q7_Essverhalten_Camembert"],
+    ["Q9_Geschmacksrichtungen: Lehne Sie Geschmacksrichtungen grundsätzlich ab?", "Q9_Ablehnung"],
+    // Q10 kommt im Template zweimal mit gleichem Headertext:
+    ["Q10: Welches Produkt verwenden Sie hauptsächlich?", "Q10_Marke"],                // 1. Auftreten
+    ["Q10: Welches Produkt verwenden Sie hauptsächlich?__SECOND__", "Q10_Marke_Andere"], // 2. Auftreten
+    ["Q11_Fettgehalt", "Q11_Fettgehalt"]
+  ]);
+}
+
+// Fallback-Heuristik, wenn Overrides / Direct-Match nicht greifen
 function guessRowKeyForHeader(header, rowKeysNormMap) {
   const h = normalize(header);
 
-  // 1) Direkte Normalisierung: exakter Norm-Match auf vorhandene row-Keys
+  // 1) Normalized direct hit
   if (rowKeysNormMap.has(h)) return rowKeysNormMap.get(h);
 
-  // 2) Spezifische Heuristiken (Q-Codes & deutschsprachige Header)
+  // 2) Heuristiken für Q-Codes
+  const tryStarts = (p) => {
+    for (const k of rowKeysNormMap.keys()) if (k.startsWith(p)) return rowKeysNormMap.get(k);
+    return null;
+  };
   if (h.includes("q2") || h.includes("gender") || h.includes("geschlecht")) {
-    for (const k of rowKeysNormMap.keys()) if (k.startsWith("q2")) return rowKeysNormMap.get(k);
+    const r = tryStarts("q2"); if (r) return r;
   }
   if (h.includes("q3") || h.includes("alter")) {
-    for (const k of rowKeysNormMap.keys()) if (k.startsWith("q3")) return rowKeysNormMap.get(k);
+    const r = tryStarts("q3"); if (r) return r;
   }
-  if (h.includes("q7") && h.includes("frisch")) {
+  if (h.includes("q7") && (h.includes("frisch") || h.includes("frischkaese"))) {
     for (const k of rowKeysNormMap.keys())
       if (k.includes("q7") && (k.includes("frisch") || k.includes("frischkaese")))
         return rowKeysNormMap.get(k);
@@ -63,13 +87,8 @@ function guessRowKeyForHeader(header, rowKeysNormMap) {
         return rowKeysNormMap.get(k);
   }
   if (h.includes("q10") && h.includes("andere")) {
-    // z. B. "Q10: Welches Produkt ...", zweite Spalte für "Andere"
     for (const k of rowKeysNormMap.keys())
-      if (k.includes("q10") && (k.includes("andere") || k.includes("andern") || k.includes("other")))
-        return rowKeysNormMap.get(k);
-    // Fallback: "_Andere"
-    for (const k of rowKeysNormMap.keys())
-      if (k.endsWith("_andere"))
+      if (k.includes("q10") && (k.includes("andere") || k.includes("andern") || k.includes("other") || k.endsWith("_andere")))
         return rowKeysNormMap.get(k);
   }
   if (h.includes("q10")) {
@@ -83,23 +102,22 @@ function guessRowKeyForHeader(header, rowKeysNormMap) {
         return rowKeysNormMap.get(k);
   }
 
-  // 3) Kein Treffer -> leer lassen (Zelle bleibt leer)
   return null;
 }
 
-// Erste leere Datenzeile (ab rowStart) finden – über die Template-Spalten
+// Erste komplett leere Zeile ab rowStart (für den Start der Festdaten)
 function findFirstEmptyRow(sheet, rowStart, colCount) {
   let r = rowStart;
   while (true) {
     const row = sheet.getRow(r);
-    let hasAny = false;
+    let any = false;
     for (let c = 1; c <= colCount; c++) {
       const v = row.getCell(c).value;
-      if (v !== null && v !== undefined && String(v) !== "") { hasAny = true; break; }
+      if (v !== null && v !== undefined && String(v) !== "") { any = true; break; }
     }
-    if (!hasAny) return r;
+    if (!any) return r;
     r++;
-    if (r > (sheet.lastRow?.number || rowStart) + 10000) return r; // Sicherheitsabbruch
+    if (r > (sheet.lastRow?.number || rowStart) + 20000) return r; // Sicherheitsabbruch
   }
 }
 
@@ -120,7 +138,7 @@ export default async function handler(req, res) {
     if (!Array.isArray(rows) || rows.length === 0)
       return res.status(400).json({ error: "rows fehlt/leer" });
 
-    // 1) Template laden (Template bleibt 1:1 erhalten)
+    // 1) Template laden
     const wb = new ExcelJS.Workbook();
     const buf = Buffer.from(
       String(templateBase64).includes("base64,")
@@ -130,44 +148,57 @@ export default async function handler(req, res) {
     );
     await wb.xlsx.load(buf);
 
-    const sheet = wb.worksheets[0]; // erstes Sheet
-    const headerRow = sheet.getRow(1);     // Row 1 = Überschriften
-    const legendRow = sheet.getRow(2);     // Row 2 = Legenden (bleibt unberührt)
+    const sheet = wb.worksheets[0];
 
-    // 2) Template-Header exakt lesen (Spaltennamen aus Row 1)
+    // 2) Header aus Zeile 1 lesen (reine Template-Spaltenbezeichnungen)
+    const headerRow = sheet.getRow(1);
     const headerNames = [];
     for (let c = 1; c <= headerRow.cellCount; c++) {
-      const val = headerRow.getCell(c).value;
-      if (!val) break;
-      headerNames.push(String(val)); // z. B. "Q2.Gender", "Q3.Altersgruppe …"
+      const v = headerRow.getCell(c).value;
+      if (!v) break;
+      headerNames.push(String(v));
     }
     const colCount = headerNames.length;
 
-    // 3) Mapping "Template-Header" -> "rows-Key" bauen
-    //    (Direktmatch, Normalisierung, Heuristiken)
+    // 3) Mapping "Template-Header" -> "rows-Key" aufbauen
     const sample = rows[0] || {};
     const rowKeys = Object.keys(sample);
     const rowKeysNormMap = new Map(rowKeys.map(k => [normalize(k), k]));
 
+    const overrides = headerOverrides();
     const headerToRowKey = new Map();
+
+    // Doppelte Header disambiguieren (z. B. Q10-Header 1/2)
+    const seenCount = Object.create(null);
+
     for (const h of headerNames) {
-      // 3a) Exakter Key im Row-Objekt vorhanden?
+      // Zählspalten nicht mappen; werden später automatisch gefüllt
+      if (isCountHeader(h)) {
+        headerToRowKey.set(h, "__AUTO_NUMBER__");
+        continue;
+      }
+
+      seenCount[h] = (seenCount[h] || 0) + 1;
+      const keyForOverride = (seenCount[h] === 2) ? `${h}__SECOND__` : h;
+
+      // 1) Fester Override
+      if (overrides.has(keyForOverride)) {
+        headerToRowKey.set(h, overrides.get(keyForOverride));
+        continue;
+      }
+
+      // 2) Exakter Key vorhanden?
       if (Object.prototype.hasOwnProperty.call(sample, h)) {
         headerToRowKey.set(h, h);
         continue;
       }
-      // 3b) Normalisierte Übereinstimmung?
-      const hNorm = normalize(h);
-      if (rowKeysNormMap.has(hNorm)) {
-        headerToRowKey.set(h, rowKeysNormMap.get(hNorm));
-        continue;
-      }
-      // 3c) Heuristiken (Q2/Q3/Q7/Q9/Q10/Q11 + deutschsprachige Header)
+
+      // 3) Normalisierung / Heuristik
       const guessed = guessRowKeyForHeader(h, rowKeysNormMap);
-      headerToRowKey.set(h, guessed);
+      headerToRowKey.set(h, guessed); // kann null sein -> Zelle bleibt leer
     }
 
-    // Debug-Preview aktivieren (optional): ?preview=1
+    // Optionaler Preview (nur URL: ?preview=1; Body unverändert)
     if (String(req.query?.preview ?? "") === "1") {
       const mappingPreview = {};
       for (const h of headerNames) mappingPreview[h] = headerToRowKey.get(h) || null;
@@ -176,21 +207,28 @@ export default async function handler(req, res) {
           headers: headerNames,
           mapping: mappingPreview,
           firstDataRow: 3,
-          rowsKeys: rowKeys
+          autoNumberedHeaders: headerNames.filter(isCountHeader)
         }
       });
     }
 
-    // 4) Erste leere Zeile ab Row 3 finden und Daten einfügen
+    // 4) Erste freie Zeile ab 3 finden & schreiben
     const START_ROW = findFirstEmptyRow(sheet, 3, colCount);
 
     let r = START_ROW;
-    for (const persona of rows) {
+    for (let i = 0; i < rows.length; i++) {
+      const persona = rows[i];
       const xRow = sheet.getRow(r);
 
       for (let c = 1; c <= colCount; c++) {
         const header = headerNames[c - 1];
-        const rowKey = headerToRowKey.get(header); // kann null sein
+        const rowKey = headerToRowKey.get(header);
+
+        if (rowKey === "__AUTO_NUMBER__") {
+          xRow.getCell(c).value = i + 1; // 1..N
+          continue;
+        }
+
         const value = rowKey ? (persona[rowKey] ?? "") : "";
         xRow.getCell(c).value = value;
       }
@@ -199,19 +237,19 @@ export default async function handler(req, res) {
       r++;
     }
 
-    // 5) QA auf separates Sheet (optional)
+    // 5) QA optional auf eigenes Sheet
     if (qa && typeof qa === "object" && Object.keys(qa).length) {
       const qaSheet = wb.addWorksheet("QA");
-      let i = 1;
+      let rr = 1;
       for (const [k, v] of Object.entries(qa)) {
-        qaSheet.getCell(i, 1).value = k;
-        qaSheet.getCell(i, 2).value =
+        qaSheet.getCell(rr, 1).value = k;
+        qaSheet.getCell(rr, 2).value =
           typeof v === "object" ? JSON.stringify(v) : String(v ?? "");
-        i++;
+        rr++;
       }
     }
 
-    // 6) Datei zurückgeben (Template bleibt unverändert, nur Daten gefüllt)
+    // 6) Datei zurückgeben
     const out = await wb.xlsx.writeBuffer();
     const outB64 = Buffer.from(out).toString("base64");
     return res.status(200).json({
