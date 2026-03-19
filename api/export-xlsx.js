@@ -9,7 +9,7 @@ export const config = {
 };
 
 // -------------------------
-// Helper: Normalisierung
+// Utilities
 // -------------------------
 function normalize(s) {
   return String(s || "")
@@ -18,106 +18,125 @@ function normalize(s) {
     .replace(/_+/g, "_")
     .replace(/^_|_$/g, "");
 }
-
-// Erkenne Zähl-/Index-Spalten (z. B. "Anzahl", "No.", "Nr")
 function isCountHeader(h) {
   const n = normalize(h);
   return n === "anzahl" || n === "no" || n === "nr" || n.startsWith("nr_");
 }
-
-// Feste Overrides: Template-Header → rows-Key
-// (inkl. Disambiguierung für doppelte Q10-Header)
-function headerOverrides() {
-  return new Map([
-    ["Q2.Gender", "Q2_Gender"],
-    ["Q3.Altersgruppe: Welcher Altersgruppe gehören Sie an?", "Q3_Age"],
-    ["Q7_Essverhalten: Wie oft verwenden Sie Frischkäse?", "Q7_Essverhalten_Frischkaese"],
-    ["Q7_Essverhalten: Wie oft verwenden Sie Gouda?", "Q7_Essverhalten_Gouda"],
-    ["Q7_Essverhalten: Wie oft verwenden Sie Butterkäse?", "Q7_Essverhalten_Butterkaese"],
-    ["Q7_Essverhalten: Wie oft verwenden Sie Camembert?", "Q7_Essverhalten_Camembert"],
-    ["Q9_Geschmacksrichtungen: Lehne Sie Geschmacksrichtungen grundsätzlich ab?", "Q9_Ablehnung"],
-    // Q10 kommt im Template zweimal mit gleichem Headertext:
-    ["Q10: Welches Produkt verwenden Sie hauptsächlich?", "Q10_Marke"],                // 1. Auftreten
-    ["Q10: Welches Produkt verwenden Sie hauptsächlich?__SECOND__", "Q10_Marke_Andere"], // 2. Auftreten
-    ["Q11_Fettgehalt", "Q11_Fettgehalt"]
-  ]);
+function buildRowKeyIndex(rowKeys) {
+  const byNorm = new Map();
+  for (const k of rowKeys) byNorm.set(normalize(k), k);
+  return byNorm;
 }
 
-// Fallback-Heuristik, wenn Overrides / Direct-Match nicht greifen
-function guessRowKeyForHeader(header, rowKeysNormMap) {
-  const h = normalize(header);
+// Kandidatenliste für Header → rows-Key (ohne feste Reihenfolge im Template)
+function candidateKeysFor(headerNorm, rowKeys) {
+  // Basis: alle rows-Keys, normalisiert
+  const rk = rowKeys.map(k => ({ raw: k, norm: normalize(k) }));
 
-  // 1) Normalized direct hit
-  if (rowKeysNormMap.has(h)) return rowKeysNormMap.get(h);
+  // Hilfsfilter
+  const has = p => rk.filter(x => x.norm.includes(p));
+  const starts = p => rk.filter(x => x.norm.startsWith(p));
 
-  // 2) Heuristiken für Q-Codes
-  const tryStarts = (p) => {
-    for (const k of rowKeysNormMap.keys()) if (k.startsWith(p)) return rowKeysNormMap.get(k);
-    return null;
-  };
-  if (h.includes("q2") || h.includes("gender") || h.includes("geschlecht")) {
-    const r = tryStarts("q2"); if (r) return r;
-  }
-  if (h.includes("q3") || h.includes("alter")) {
-    const r = tryStarts("q3"); if (r) return r;
-  }
-  if (h.includes("q7") && (h.includes("frisch") || h.includes("frischkaese"))) {
-    for (const k of rowKeysNormMap.keys())
-      if (k.includes("q7") && (k.includes("frisch") || k.includes("frischkaese")))
-        return rowKeysNormMap.get(k);
-  }
-  if (h.includes("q7") && h.includes("gouda")) {
-    for (const k of rowKeysNormMap.keys())
-      if (k.includes("q7") && k.includes("gouda"))
-        return rowKeysNormMap.get(k);
-  }
-  if (h.includes("q7") && (h.includes("butter") || h.includes("butterkaese"))) {
-    for (const k of rowKeysNormMap.keys())
-      if (k.includes("q7") && (k.includes("butter") || k.includes("butterkaese")))
-        return rowKeysNormMap.get(k);
-  }
-  if (h.includes("q7") && h.includes("camembert")) {
-    for (const k of rowKeysNormMap.keys())
-      if (k.includes("q7") && k.includes("camembert"))
-        return rowKeysNormMap.get(k);
-  }
-  if (h.includes("q9") && (h.includes("ablehn") || h.includes("keine"))) {
-    for (const k of rowKeysNormMap.keys())
-      if (k.includes("q9"))
-        return rowKeysNormMap.get(k);
-  }
-  if (h.includes("q10") && h.includes("andere")) {
-    for (const k of rowKeysNormMap.keys())
-      if (k.includes("q10") && (k.includes("andere") || k.includes("andern") || k.includes("other") || k.endsWith("_andere")))
-        return rowKeysNormMap.get(k);
-  }
-  if (h.includes("q10")) {
-    for (const k of rowKeysNormMap.keys())
-      if (k.includes("q10") && !k.endsWith("_andere"))
-        return rowKeysNormMap.get(k);
-  }
-  if (h.includes("q11") || h.includes("fett")) {
-    for (const k of rowKeysNormMap.keys())
-      if (k.includes("q11") || k.includes("fett"))
-        return rowKeysNormMap.get(k);
+  // Q10-Speziallogik (Marke / Andere)
+  if (headerNorm.includes("q10")) {
+    // „Andere“ bevorzugen, wenn Header Begriffe enthält; sonst „Marke“
+    if (/(andere|andern|other)/.test(headerNorm)) {
+      const andere = rk.filter(x => /(q10.*andere$|_andere$)/.test(x.norm));
+      const rest = has("q10").filter(x => !/_andere$/.test(x.norm));
+      return [...andere, ...rest];
+    }
+    // Generisch: erst Marke, dann Andere, dann sonstige q10
+    const q10Marke = rk.filter(x => /^q10(_marke)?$/.test(x.norm));
+    const q10Andere = rk.filter(x => /(q10.*andere$|_andere$)/.test(x.norm));
+    const q10Rest = has("q10").filter(x => !q10Marke.includes(x) && !q10Andere.includes(x));
+    return [...q10Marke, ...q10Andere, ...q10Rest];
   }
 
-  return null;
+  // Q11 Fett
+  if (headerNorm.includes("q11") || headerNorm.includes("fett")) {
+    const q11 = has("q11");
+    const fett = rk.filter(x => x.norm.includes("fett"));
+    return [...q11, ...fett];
+  }
+
+  // Q9 Ablehnung
+  if (headerNorm.includes("q9") || headerNorm.includes("ablehn") || headerNorm.includes("keine")) {
+    return has("q9");
+  }
+
+  // Q7 Verbrauch
+  if (headerNorm.includes("q7")) {
+    // feiner nach Frischkäse / Gouda / Butterkäse / Camembert
+    const prio = ["frisch", "frischkaese", "gouda", "butter", "butterkaese", "camembert"];
+    const out = [];
+    for (const p of prio) out.push(...rk.filter(x => x.norm.includes("q7") && x.norm.includes(p)));
+    const rest = rk.filter(x => x.norm.includes("q7") && !out.includes(x));
+    return [...out, ...rest];
+  }
+
+  // Q2/Q3 (Gender/Age)
+  if (headerNorm.includes("q2") || headerNorm.includes("gender") || headerNorm.includes("geschlecht")) {
+    return starts("q2");
+  }
+  if (headerNorm.includes("q3") || headerNorm.includes("alter")) {
+    return starts("q3");
+  }
+
+  // Fallback: exakte Norm-Übereinstimmung
+  return [];
 }
 
-// Erste komplett leere Zeile ab rowStart (für den Start der Festdaten)
+// Mapping je Auftreten (Duplikate) robust berechnen
+function buildHeaderToRowKeyMapping(headerNames, sampleRow) {
+  const rowKeys = Object.keys(sampleRow || {});
+  const byNorm = buildRowKeyIndex(rowKeys);
+  const taken = new Set();                  // bereits vergebene rows-Keys
+  const counter = Object.create(null);      // Auftretenszähler je Header-Text
+  const map = new Map();
+
+  for (const h of headerNames) {
+    // Zählspalten automatisch füllen
+    if (isCountHeader(h)) { map.set(h, "__AUTO_NUMBER__"); continue; }
+
+    counter[h] = (counter[h] || 0) + 1;
+    const norm = normalize(h);
+
+    // 1) Exakter Key vorhanden?
+    if (Object.prototype.hasOwnProperty.call(sampleRow, h) && !taken.has(h)) {
+      map.set(h, h); taken.add(h); continue;
+    }
+
+    // 2) Normalisierte Übereinstimmung?
+    const direct = byNorm.get(norm);
+    if (direct && !taken.has(direct)) { map.set(h, direct); taken.add(direct); continue; }
+
+    // 3) Kandidatenliste (prio-gestützt je Header)
+    const cand = candidateKeysFor(norm, rowKeys)
+      .map(x => x.raw)
+      .filter(k => !taken.has(k));
+
+    // Bei Duplikaten (z. B. zweites „Q10: …“) den noch nicht vergebenen Kandidaten wählen
+    const pick = cand[0] || null;
+    map.set(h, pick);
+    if (pick) taken.add(pick);
+  }
+
+  return map;
+}
+
+// Erste komplett leere Zeile ab rowStart (bleibt am Template unkritisch)
 function findFirstEmptyRow(sheet, rowStart, colCount) {
   let r = rowStart;
   while (true) {
     const row = sheet.getRow(r);
-    let any = false;
+    let hasAny = false;
     for (let c = 1; c <= colCount; c++) {
       const v = row.getCell(c).value;
-      if (v !== null && v !== undefined && String(v) !== "") { any = true; break; }
+      if (v !== null && v !== undefined && String(v) !== "") { hasAny = true; break; }
     }
-    if (!any) return r;
+    if (!hasAny) return r;
     r++;
-    if (r > (sheet.lastRow?.number || rowStart) + 20000) return r; // Sicherheitsabbruch
+    if (r > (sheet.lastRow?.number || rowStart) + 20000) return r;
   }
 }
 
@@ -138,7 +157,7 @@ export default async function handler(req, res) {
     if (!Array.isArray(rows) || rows.length === 0)
       return res.status(400).json({ error: "rows fehlt/leer" });
 
-    // 1) Template laden
+    // 1) Template laden (Template bleibt 1:1 erhalten)
     const wb = new ExcelJS.Workbook();
     const buf = Buffer.from(
       String(templateBase64).includes("base64,")
@@ -149,9 +168,10 @@ export default async function handler(req, res) {
     await wb.xlsx.load(buf);
 
     const sheet = wb.worksheets[0];
-
-    // 2) Header aus Zeile 1 lesen (reine Template-Spaltenbezeichnungen)
     const headerRow = sheet.getRow(1);
+    const legendRow = sheet.getRow(2); // wird nicht verändert (siehe Template) [1](https://ftteststudio-my.sharepoint.com/personal/thelen_carolin_ftstudio_de/_layouts/15/Doc.aspx?sourcedoc=%7BA9CD4E10-78BA-4992-8E44-E0F101970CD3%7D&file=Screener%20Daten%20Cream%20Cheese%20DE%20HH.xlsx&action=default&mobileredirect=true)
+
+    // 2) Template-Header aus Zeile 1 lesen
     const headerNames = [];
     for (let c = 1; c <= headerRow.cellCount; c++) {
       const v = headerRow.getCell(c).value;
@@ -160,60 +180,26 @@ export default async function handler(req, res) {
     }
     const colCount = headerNames.length;
 
-    // 3) Mapping "Template-Header" -> "rows-Key" aufbauen
+    // 3) Mapping Header -> rows-Key (Duplikate robust behandeln)
     const sample = rows[0] || {};
-    const rowKeys = Object.keys(sample);
-    const rowKeysNormMap = new Map(rowKeys.map(k => [normalize(k), k]));
+    const headerToRowKey = buildHeaderToRowKeyMapping(headerNames, sample);
 
-    const overrides = headerOverrides();
-    const headerToRowKey = new Map();
-
-    // Doppelte Header disambiguieren (z. B. Q10-Header 1/2)
-    const seenCount = Object.create(null);
-
-    for (const h of headerNames) {
-      // Zählspalten nicht mappen; werden später automatisch gefüllt
-      if (isCountHeader(h)) {
-        headerToRowKey.set(h, "__AUTO_NUMBER__");
-        continue;
-      }
-
-      seenCount[h] = (seenCount[h] || 0) + 1;
-      const keyForOverride = (seenCount[h] === 2) ? `${h}__SECOND__` : h;
-
-      // 1) Fester Override
-      if (overrides.has(keyForOverride)) {
-        headerToRowKey.set(h, overrides.get(keyForOverride));
-        continue;
-      }
-
-      // 2) Exakter Key vorhanden?
-      if (Object.prototype.hasOwnProperty.call(sample, h)) {
-        headerToRowKey.set(h, h);
-        continue;
-      }
-
-      // 3) Normalisierung / Heuristik
-      const guessed = guessRowKeyForHeader(h, rowKeysNormMap);
-      headerToRowKey.set(h, guessed); // kann null sein -> Zelle bleibt leer
-    }
-
-    // Optionaler Preview (nur URL: ?preview=1; Body unverändert)
+    // Preview-Modus (Body bleibt unverändert; nützlich zum Testen)
     if (String(req.query?.preview ?? "") === "1") {
-      const mappingPreview = {};
-      for (const h of headerNames) mappingPreview[h] = headerToRowKey.get(h) || null;
+      const mapping = {};
+      for (const h of headerNames) mapping[h] = headerToRowKey.get(h) || null;
       return res.status(200).json({
         preview: {
           headers: headerNames,
-          mapping: mappingPreview,
+          mapping,
           firstDataRow: 3,
           autoNumberedHeaders: headerNames.filter(isCountHeader)
         }
       });
     }
 
-    // 4) Erste freie Zeile ab 3 finden & schreiben
-    const START_ROW = findFirstEmptyRow(sheet, 3, colCount);
+    // 4) Erste leere Zeile ab 3 suchen, Daten eintragen
+    const START_ROW = findFirstEmptyRow(sheet, 3, colCount); // Zeile 1+2 sind Header/Legenden [1](https://ftteststudio-my.sharepoint.com/personal/thelen_carolin_ftstudio_de/_layouts/15/Doc.aspx?sourcedoc=%7BA9CD4E10-78BA-4992-8E44-E0F101970CD3%7D&file=Screener%20Daten%20Cream%20Cheese%20DE%20HH.xlsx&action=default&mobileredirect=true)
 
     let r = START_ROW;
     for (let i = 0; i < rows.length; i++) {
@@ -237,7 +223,7 @@ export default async function handler(req, res) {
       r++;
     }
 
-    // 5) QA optional auf eigenes Sheet
+    // 5) QA optional als separates Sheet
     if (qa && typeof qa === "object" && Object.keys(qa).length) {
       const qaSheet = wb.addWorksheet("QA");
       let rr = 1;
