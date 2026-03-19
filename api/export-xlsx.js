@@ -72,8 +72,31 @@ export default async function handler(req, res) {
       excelRow.commit();
       rowIndex++;
     }
+// 4) ===== OPTIONAL: QA-SHEET ERZEUGEN =====
+if (qa && typeof qa === "object" && Object.keys(qa).length) {
+  const qaSheet = wb.addWorksheet("QA");
 
-    // --- 4) Datei zurückgeben ---
+  let row = 1;
+
+  // Funktion zum rekursiven Schreiben (unterstützt verschachtelte Objekte)
+  function writeQA(prefix, obj) {
+    for (const [key, value] of Object.entries(obj)) {
+      if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+        writeQA(`${prefix}${key}.`, value);
+      } else {
+        qaSheet.getCell(row, 1).value = `${prefix}${key}`;
+        qaSheet.getCell(row, 2).value =
+          typeof value === "string" || typeof value === "number"
+            ? value
+            : JSON.stringify(value);
+        row++;
+      }
+    }
+  }
+
+  writeQA("", qa);
+}
+    // --- 5) Datei zurückgeben ---
     const outputBuffer = await workbook.xlsx.writeBuffer();
     const base64 = Buffer.from(outputBuffer).toString("base64");
 
