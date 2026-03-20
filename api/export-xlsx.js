@@ -1,24 +1,19 @@
 // /api/export-xlsx.js
 import ExcelJS from "exceljs";
 
-export const config = {
-  api: { bodyParser: { sizeLimit: "25mb" } } // falls große Templates
-};
+export const config = { api: { bodyParser: { sizeLimit: "25mb" } } };
 
 export default async function handler(req, res) {
   try {
-    if (req.method !== "POST") {
-      return res.status(405).json({ error: "Method not allowed" });
-    }
+    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-    // --- Body robust einlesen (RAW oder bereits geparst) ---
+    // --- Body robust einlesen ---
     const raw = req.body;
     const body = (typeof raw === "string") ? JSON.parse(raw) : (raw || {});
-    const { templateBase64, rows, qa, prefix, sheets } = body;
+    const { templateBase64, rows, qa, prefix, sheets, headerOrder, dataStartRow } = body;
 
     if (!templateBase64) return res.status(400).json({ error: "templateBase64 fehlt" });
 
-    // --- Template laden ---
     const wb = new ExcelJS.Workbook();
     const tplBuf = Buffer.from(
       String(templateBase64).includes("base64,")
@@ -28,75 +23,98 @@ export default async function handler(req, res) {
     );
     await wb.xlsx.load(tplBuf);
 
-    // ### Hilfsfunktionen ####################################################
+    // === Helpers ===========================================================
+    const DATA_START = Number.isFinite(Number(dataStartRow)) ? Number(dataStartRow) : 3;
 
-    // Auto-Spaltenbreite (simpler Heuristik-basiert)
-    function autoFitColumns(worksheet, fromRow = 1, toRow = null) {
-      const lastRow = toRow || worksheet.rowCount;
-      worksheet.columns.forEach((col) => {
-        let max = 8; // Mindestbreite
-        for (let r = fromRow; r <= lastRow; r++) {
-          const v = String(worksheet.getRow(r).getCell(col.number).value ?? "");
-          if (v.length > max) max = v.length;
+    const toStr = (v) => (v == null ? "" : String(v));
+    const isObj = (x) => x && typeof x === "object" && !Array.isArray(x);
+
+    // Kopieren von Merges vom Template ins Ziel (nur die Bereiche, die bisher existieren)
+    function copyMerges(src, dst) {
+      // ExcelJS speichert Merges intern; wir lesen die Ranges über model (private API fallback)
+      const merges = src?._merges ? Array.from(src._merges) : [];
+      for (const m of merges) {
+        try { dst.mergeCells(m); } catch { /* ignore overlapping merges */ }
+      }
+    }
+
+    // Werte + Styles Zelle für Zelle kopieren
+    function copyCell(srcCell, dstCell) {
+      dstCell.value = srcCell.value;
+      if (srcCell.style) dstCell.style = { ...srcCell.style };
+      if (srcCell.font) dstCell.font = { ...srcCell.font };
+      if (srcCell.alignment) dstCell.alignment = { ...srcCell.alignment };
+      if (srcCell.border) dstCell.border = { ...srcCell.border };
+      if (srcCell.fill) dstCell.fill = { ...srcCell.fill };
+      if (srcCell.numFmt) dstCell.numFmt = srcCell.numFmt;
+      if (srcCell.protection) dstCell.protection = { ...srcCell.protection };
+    }
+
+    // gesamten Kopfbereich (1..DATA_START-1) Zeile für Zeile kopieren
+    function cloneHeader(srcWs, dstWs, headerRowsEnd = DATA_START - 1) {
+      // Spaltenbreiten kopieren
+      dstWs.columns = srcWs.columns.map(c => ({ width: c.width || 10 }));
+      // Kopfzeilen (1..headerRowsEnd) kopieren
+      for (let r = 1; r <= Math.max(1, headerRowsEnd); r++) {
+        const srcRow = srcWs.getRow(r);
+        const dstRow = dstWs.getRow(r);
+        for (let c = 1; c <= srcRow.cellCount; c++) {
+          copyCell(srcRow.getCell(c), dstRow.getCell(c));
         }
-        col.width = Math.min(Math.max(10, Math.ceil(max * 1.1)), 60);
-      });
+        dstRow.commit();
+      }
+      // Prototyp‑Datenzeile (DATA_START) – nur Styles übernehmen
+      const protoSrc = srcWs.getRow(DATA_START);
+      const protoDst = dstWs.getRow(DATA_START);
+      for (let c = 1; c <= protoSrc.cellCount; c++) {
+        copyCell(protoSrc.getCell(c), protoDst.getCell(c));
+        // Werte der Prototypzeile Leer lassen
+        protoDst.getCell(c).value = null;
+      }
+      protoDst.commit();
+
+      // Merges übernehmen (Header + ggf. Prototyp)
+      copyMerges(srcWs, dstWs);
     }
 
-    // kopiert Style-Eigenschaften von Quellzelle auf Zielzelle
-    function copyCellStyle(src, dst) {
-      if (!src || !dst) return;
-      dst.style = { ...src.style }; // ExcelJS kopiert style-Objekt
-      // Einzelkomponenten defensiv setzen (falls style-Objekt unvollständig ist)
-      if (src.font)       dst.font = { ...src.font };
-      if (src.alignment)  dst.alignment = { ...src.alignment };
-      if (src.border)     dst.border = { ...src.border };
-      if (src.fill)       dst.fill = { ...src.fill };
-      if (src.numFmt)     dst.numFmt = src.numFmt;
-      if (src.protection) dst.protection = { ...src.protection };
-    }
+    // Daten schreiben: ENTWEDER nach headerOrder (empfohlen) ODER heuristisch über Row 1
+    function writeDataRows(ws, dataRows, headerOrderOpt) {
+      if (!Array.isArray(dataRows) || dataRows.length === 0) return;
 
-    // dupliziert eine ganze Zeile (Werte optional ignorieren) als "Style-Schablone"
-    function duplicateStyleRow(worksheet, templateRowNumber, countToInsert) {
-      if (countToInsert <= 0) return;
-      worksheet.duplicateRow(templateRowNumber, countToInsert, true); // insert = true
-      // Werte der frisch eingefügten Zeilen leeren (nur falls Templates Werte tragen)
-      for (let i = 0; i < countToInsert; i++) {
-        const r = worksheet.getRow(templateRowNumber + i);
-        r.eachCell((cell) => { if (cell.type !== ExcelJS.ValueType.Merge) cell.value = null; });
-        r.commit();
+      let headers = null;
+
+      if (Array.isArray(headerOrderOpt) && headerOrderOpt.length) {
+        // feste Reihenfolge aus Template/Codebook
+        headers = headerOrderOpt.slice();
+      } else {
+        // Heuristik (Fallback): nimm die erste nicht-leere Zeile als Header
+        const headerRow = ws.getRow(1);
+        const h = [];
+        for (let c = 1; c <= headerRow.cellCount; c++) {
+          const v = headerRow.getCell(c).value;
+          if (v == null || v === "") break;
+          h.push(String(v));
+        }
+        headers = h;
       }
-    }
 
-    // schreibt rows[] in ein Worksheet ab dataStartRow, ohne Header zu berühren
-    function writeDataRowsPreservingStyles(worksheet, rowsArray, dataStartRow = 3) {
-      if (!Array.isArray(rowsArray) || rowsArray.length === 0) {
-        throw new Error("rows fehlt/leer");
-      }
-      // Header aus Zeile 1 (dein Template) lesen → Reihenfolge bleibt exakt
-      const headerRow = worksheet.getRow(1);
-      const headers = [];
-      for (let c = 1; c <= headerRow.cellCount; c++) {
-        const v = headerRow.getCell(c).value;
-        if (v == null || v === "") break; // bis zur ersten leeren Zelle
-        headers.push(String(v));
-      }
-      if (!headers.length) throw new Error("Headerzeile (Row 1) leer.");
+      if (!headers || headers.length === 0) throw new Error("Export: keine Header bestimmt (headerOrder übergeben!).");
 
-      // sicherstellen, dass genug Datenzeilen mit Style existieren
-      // wir nehmen Zeile dataStartRow als "Prototyp" für Styles/Merges
-      const need = Math.max(0, rowsArray.length - (worksheet.rowCount - (dataStartRow - 1)));
-      if (need > 0) duplicateStyleRow(worksheet, dataStartRow, need);
+      // ggf. ausreichende Anzahl Datenzeilen (als Style‑Kopie der Prototyp‑Zeile) einfügen
+      const need = Math.max(0, dataRows.length - (ws.rowCount - (DATA_START - 1)));
+      if (need > 0) ws.duplicateRow(DATA_START, need, true);
 
-      // Zellen beschreiben (KEIN row.values = …), nur Werte setzen
-      for (let i = 0; i < rowsArray.length; i++) {
-        const src = rowsArray[i] || {};
-        const rowNum = dataStartRow + i;
-        const xRow = worksheet.getRow(rowNum);
+      // Zellen füllen – strikt nach Spaltenindex 1..headers.length
+      for (let i = 0; i < dataRows.length; i++) {
+        const src = dataRows[i] || {};
+        const rowNum = DATA_START + i;
+        const xRow = ws.getRow(rowNum);
 
         for (let c = 1; c <= headers.length; c++) {
           const header = headers[c - 1];
           const cell = xRow.getCell(c);
+          // Wenn keys exakt dem Header entsprechen: direkt nehmen
+          // Falls deine Rows intern kürzere Keys benutzen, mappst du sie upstream.
           const val = Object.prototype.hasOwnProperty.call(src, header) ? src[header] : "";
           cell.value = (val == null ? "" : val);
         }
@@ -104,139 +122,104 @@ export default async function handler(req, res) {
       }
     }
 
-    // QA-Sheet erzeugen: mit Ampel (grün/gelb/rot) & "Delta‑Bars" (Blockgrafik)
-    function buildQASheet(workbook, qa, name = "QA") {
-      if (!qa || typeof qa !== "object") return;
+    // QA‑Sheet (wie zuvor)
+    function buildQASheet(workbook, qaObj, name = "QA") {
+      if (!qaObj || typeof qaObj !== "object") return;
       const ws = workbook.addWorksheet(name);
       let r = 1;
-
-      // Helper für Delta-Balken (ASCII)
       const bar = (x, maxAbs = 100, len = 20) => {
         const v = Math.max(-maxAbs, Math.min(maxAbs, Number(x) || 0));
         const n = Math.round(Math.abs(v) / maxAbs * len);
         const blocks = "█".repeat(n);
         return v >= 0 ? blocks : `-${blocks}`;
       };
-
-      // Helper für Ampel: Färbe Zelle anhand diff
       const setTrafficFill = (cell, diff) => {
         let color = "FF92D050"; // grün
-        if (Math.abs(diff) <= 1) color = "FFFFFF00"; // gelb (nahe 0)
-        if (diff < -1) color = "FFFF0000"; // rot (negativ)
+        if (Math.abs(diff) <= 1) color = "FFFFFF00"; // gelb
+        if (diff < -1) color = "FFFF0000";          // rot
         cell.fill = { type: 'pattern', pattern:'solid', fgColor:{ argb: color } };
       };
 
       ws.getCell(r,1).value = "QA Übersicht"; ws.getCell(r,1).font = { bold:true, size:14 }; r+=2;
 
-      // Stichprobe
-      ws.getCell(r,1).value = "Stichprobe"; ws.getCell(r,2).value = qa.stichprobe || 0; r+=2;
+      ws.getCell(r,1).value = "Stichprobe"; ws.getCell(r,2).value = qaObj.stichprobe || 0; r+=2;
 
-      // Brands (falls vorhanden)
-      if (qa.brands) {
+      if (qaObj.brands) {
         ws.getCell(r,1).value = "Marken Soll (scaled)"; ws.getCell(r,1).font = { bold:true }; r++;
-        ws.getCell(r,1).value = "Kerrygold"; ws.getCell(r,2).value = qa.brands.soll_scaled?.Kerrygold ?? null; r++;
-        ws.getCell(r,1).value = "Andere";    ws.getCell(r,2).value = qa.brands.soll_scaled?.Andere ?? null; r+=2;
+        ws.getCell(r,1).value = "Kerrygold"; ws.getCell(r,2).value = qaObj.brands.soll_scaled?.Kerrygold ?? null; r++;
+        ws.getCell(r,1).value = "Andere";    ws.getCell(r,2).value = qaObj.brands.soll_scaled?.Andere ?? null; r+=2;
 
         ws.getCell(r,1).value = "Marken Ist"; ws.getCell(r,1).font = { bold:true }; r++;
-        const kgIst = qa.brands.ist?.Kerrygold ?? 0;
-        const anIst = qa.brands.ist?.Andere ?? 0;
+        const kgIst = qaObj.brands.ist?.Kerrygold ?? 0;
+        const anIst = qaObj.brands.ist?.Andere ?? 0;
         ws.getCell(r,1).value = "Kerrygold"; ws.getCell(r,2).value = kgIst; r++;
         ws.getCell(r,1).value = "Andere";    ws.getCell(r,2).value = anIst; r+=2;
 
         ws.getCell(r,1).value = "Differenzen"; ws.getCell(r,1).font = { bold:true }; r++;
-        const kgDiff = qa.brands.diff?.Kerrygold ?? 0;
-        const anDiff = qa.brands.diff?.Andere ?? 0;
+        const kgDiff = qaObj.brands.diff?.Kerrygold ?? 0;
+        const anDiff = qaObj.brands.diff?.Andere ?? 0;
         ws.getCell(r,1).value = "Kerrygold"; ws.getCell(r,2).value = kgDiff; setTrafficFill(ws.getCell(r,2), kgDiff);
-        ws.getCell(r,3).value = bar(kgDiff, Math.max(qa.stichprobe||1, 100)); r++;
+        ws.getCell(r,3).value = bar(kgDiff, Math.max(qaObj.stichprobe||1, 100)); r++;
         ws.getCell(r,1).value = "Andere";    ws.getCell(r,2).value = anDiff; setTrafficFill(ws.getCell(r,2), anDiff);
-        ws.getCell(r,3).value = bar(anDiff, Math.max(qa.stichprobe||1, 100)); r+=2;
+        ws.getCell(r,3).value = bar(anDiff, Math.max(qaObj.stichprobe||1, 100)); r+=2;
 
-        // Free-Text Anteil, wenn vorhanden
-        if (qa.brands.pools) {
+        if (qaObj.brands.pools) {
           ws.getCell(r,1).value = "Free-Text Code / Anteil"; ws.getCell(r,1).font = { bold:true }; r++;
-          ws.getCell(r,1).value = String(qa.brands.pools.free_text_code || "");
-          ws.getCell(r,2).value = qa.brands.pools.free_text_share || 0; ws.getCell(r,2).numFmt = "0.00%";
-          ws.getCell(r,3).value = qa.brands.pools.free_text_rate || 0; ws.getCell(r,3).numFmt = "0.00%"; r+=2;
+          ws.getCell(r,1).value = String(qaObj.brands.pools.free_text_code || "");
+          ws.getCell(r,2).value = qaObj.brands.pools.free_text_share || 0; ws.getCell(r,2).numFmt = "0.00%";
+          ws.getCell(r,3).value = qaObj.brands.pools.free_text_rate || 0;  ws.getCell(r,3).numFmt = "0.00%"; r+=2;
         }
       }
 
-      // Beliebige weitere Blöcke flach ausschreiben
-      ws.getCell(r,1).value = "Verteilungen (Gender/Age/Brand/Fett)"; ws.getCell(r,1).font = { bold:true }; r++;
-      for (const [title, map] of [["Gender", qa.gender], ["Age", qa.age], ["Brand", qa.brand], ["Fett", qa.fett]]) {
+      const blocks = [["Gender", qaObj.gender], ["Age", qaObj.age], ["Brand", qaObj.brand], ["Fett", qaObj.fett]];
+      for (const [title, map] of blocks) {
         if (!map) continue;
         ws.getCell(r,1).value = title; ws.getCell(r,1).font = { italic:true }; r++;
         for (const [k,v] of Object.entries(map)) { ws.getCell(r,1).value = k; ws.getCell(r,2).value = v; r++; }
         r++;
       }
 
-      autoFitColumns(ws, 1, ws.rowCount);
-    }
-
-    // Multi-Sheet Support: sheets:[{name, rows, qa}]
-    async function writeSingleSheetFromTemplate(ws, dataRows, optQA) {
-      writeDataRowsPreservingStyles(ws, dataRows, 3);
-      if (optQA) buildQASheet(wb, optQA, "QA");
-    }
-
-    async function writeMultiSheetsFromTemplate(tplSheet, list) {
-      // Erstes Element befüllt das bestehende Template-Sheet
-      const first = list[0];
-      await writeSingleSheetFromTemplate(tplSheet, first.rows || [], first.qa || null);
-      // weitere Elemente: neue Sheets anlegen und Header/Styles reproduzieren
-      for (let i = 1; i < list.length; i++) {
-        const el = list[i];
-        const ws = wb.addWorksheet(String(el.name || `Sheet_${i+1}`));
-
-        // Kopfzeilen-/Vorlagenbereich (z. B. Zeilen 1..2) aus dem Template übernehmen
-        // Kopiere Werte + Styles Zelle für Zelle
-        const headerMaxRow = 2; // Falls dein Template 2 Kopfzeilen hat; ggf. anpassen
-        for (let r = 1; r <= headerMaxRow; r++) {
-          const srcRow = tplSheet.getRow(r);
-          const dstRow = ws.getRow(r);
-          for (let c = 1; c <= srcRow.cellCount; c++) {
-            const srcCell = srcRow.getCell(c);
-            const dstCell = dstRow.getCell(c);
-            dstCell.value = srcCell.value; // Text/Formula übernehmen
-            copyCellStyle(srcCell, dstCell); // Styles kopieren
-          }
-          dstRow.commit();
+      // simpler Auto-Fit
+      ws.columns.forEach((col) => {
+        let max = 10;
+        for (let rr = 1; rr <= ws.rowCount; rr++) {
+          const v = toStr(ws.getRow(rr).getCell(col.number).value);
+          if (v.length > max) max = v.length;
         }
-        // Spaltenbreiten vom Template übernehmen
-        ws.columns = tplSheet.columns.map(col => ({ width: col.width || 10 }));
-
-        // Datenzeile 3 als Prototyp im Zielsheet anlegen
-        // (Kopiere Styles der Zeile 3 aus dem Templatesheet)
-        const srcProto = tplSheet.getRow(3);
-        const dstProto = ws.getRow(3);
-        for (let c = 1; c <= srcProto.cellCount; c++) {
-          const srcCell = srcProto.getCell(c);
-          const dstCell = dstProto.getCell(c);
-          copyCellStyle(srcCell, dstCell);
-        }
-        dstProto.commit();
-
-        // Jetzt Daten schreiben (inkl. Duplicate-Row bei Bedarf)
-        writeDataRowsPreservingStyles(ws, el.rows || [], 3);
-
-        // QA pro Sheet? (optional)
-        if (el.qa) buildQASheet(wb, el.qa, `QA_${el.name || i+1}`);
-      }
+        col.width = Math.min(Math.max(10, Math.ceil(max * 1.1)), 60);
+      });
     }
 
-    // ### Single vs Multi Sheets #############################################
+    // === Single vs. Multi ================================================
     const tplSheet = wb.worksheets[0];
     if (!tplSheet) return res.status(400).json({ error: "Kein Worksheet im Template gefunden." });
 
     if (Array.isArray(sheets) && sheets.length > 0) {
-      await writeMultiSheetsFromTemplate(tplSheet, sheets);
+      // Erstes Dataset schreibt ins Template-Sheet
+      writeDataRows(tplSheet, sheets[0].rows || [], headerOrder);
+      if (sheets[0].qa) buildQASheet(wb, sheets[0].qa, "QA");
+
+      // Weitere Datasets in neue Sheets (Header komplett klonen)
+      for (let i = 1; i < sheets.length; i++) {
+        const el = sheets[i];
+        const ws = wb.addWorksheet(String(el.name || `Sheet_${i+1}`), {
+          properties: { ...tplSheet.properties },
+          pageSetup:  { ...tplSheet.pageSetup  },
+          views:      tplSheet.views ? JSON.parse(JSON.stringify(tplSheet.views)) : undefined
+        });
+        cloneHeader(tplSheet, ws, DATA_START - 1);
+        writeDataRows(ws, el.rows || [], headerOrder);
+        if (el.qa) buildQASheet(wb, el.qa, `QA_${el.name || i+1}`);
+      }
     } else {
-      await writeSingleSheetFromTemplate(tplSheet, rows || [], qa || null);
+      // Single Sheet
+      writeDataRows(tplSheet, rows || [], headerOrder);
+      if (qa) buildQASheet(wb, qa, "QA");
     }
 
-    // --- Ausgabe als Base64 zurück ---
     const outBuf = await wb.xlsx.writeBuffer();
     const outB64 = Buffer.from(outBuf).toString("base64");
-    const fileName = Array.isArray(sheets) && sheets.length > 0
+    const fileName = (Array.isArray(sheets) && sheets.length > 1)
       ? `${String(prefix || "SITE")}_Festdaten_multi.xlsx`
       : `${String(prefix || "SITE")}_Festdaten.xlsx`;
 
