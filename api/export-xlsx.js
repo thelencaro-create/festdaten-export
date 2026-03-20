@@ -1,5 +1,5 @@
-// /api/export-xlsx.js  (Next.js API Route)
-// v3.2 — Q10-Paar wird anhand sichtbarer Header (Row 1) korrekt zugeordnet
+// /api/export-xlsx.js
+// v3.3 — Sichtbare-Header-first Mapping für ALLE Spalten (+ Q10-Paar sicher), Nummerierung & QA inklusive
 import ExcelJS from "exceljs";
 
 export const config = {
@@ -10,7 +10,7 @@ export default async function handler(req, res) {
   try {
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-    // ----- 0) Body einlesen -----
+    // ---- 0) Body lesen ----
     const raw = req.body;
     const body =
       typeof raw === "string" ? JSON.parse(raw) :
@@ -22,16 +22,13 @@ export default async function handler(req, res) {
       qa,                   // Single-sheet QA
       sheets,               // Multi-sheet: [{ name, rows, qa }]
       prefix = "SITE",
-      headerOrder,          // = codebook.column_order  (Pflicht!)
+      headerOrder,          // optional Sicherheitsnetz (column_order)
       dataStartRow = 4
     } = body;
 
     if (!templateBase64) return res.status(400).json({ error: "templateBase64 fehlt" });
-    if (!Array.isArray(headerOrder) || !headerOrder.length) {
-      return res.status(400).json({ error: "headerOrder (column_order) fehlt/leer." });
-    }
 
-    // ----- 1) Template laden -----
+    // ---- 1) Template laden ----
     const wb = new ExcelJS.Workbook();
     const tplBuf = Buffer.from(
       String(templateBase64).includes("base64,")
@@ -44,8 +41,8 @@ export default async function handler(req, res) {
     const tplSheet = wb.worksheets[0];
     if (!tplSheet) return res.status(400).json({ error: "Kein Worksheet im Template" });
 
-    // ----- 2) Sichtbare Headertexte (Row 1) lesen -----
-    function readTemplateHeaderTexts(ws) {
+    // ---- 2) Sichtbare Headertexte (Row 1) lesen ----
+    function readVisibleHeaders(ws) {
       const headerRow = ws.getRow(1);
       const out = [];
       for (let c = 1; c <= headerRow.cellCount; c++) {
@@ -55,40 +52,67 @@ export default async function handler(req, res) {
       }
       return out;
     }
+    const visible = readVisibleHeaders(tplSheet);
 
-    const visibleHeaderTexts = readTemplateHeaderTexts(tplSheet);
+    // ---- 3) Heuristiken ----
+    const lc = (s)=>String(s||"").toLowerCase();
+    const isNumHdr = (t) => {
+      const h = lc(t).trim();
+      return ["anzahl","no.","no","nr.","nr"].includes(h);
+    };
+    const isQ10AndereHdr = (t) => {
+      const h = lc(t);
+      return h.includes("keine") || h.includes("andere") || h.includes("markenname");
+    };
 
-    // ----- 3) Q10-Paar anhand sichtbarer Header justieren -----
-    function isAndereHeader(txt) {
-      const H = String(txt || "").toLowerCase();
-      return H.includes("keine") || H.includes("andere") || H.includes("markenname");
-    }
+    // ---- 4) Sichtbare-Header-first: Spaltenplan aufstellen (pro Spalte 1 Key oder "__NUM__") ----
+    function keyForHeaderText(txt) {
+      const h = lc(txt);
 
-    function adjustQ10OrderWithVisible(order, visible) {
-      if (!Array.isArray(order) || !order.length) return order;
-      const eff = order.slice();
+      // Nummerierung
+      if (isNumHdr(txt)) return "__NUM__";
 
-      const iMain = eff.findIndex(k => String(k).toLowerCase() === "q10_marke");
-      const iAlt  = eff.findIndex(k => String(k).toLowerCase() === "q10_marke_andere");
-      if (iMain < 0 || iAlt < 0) return eff;
+      // Q2 Gender
+      if (h.includes("q2") && (h.includes("gender") || h.includes("geschlecht"))) return "Q2_Gender";
 
-      const visMain = visible[iMain] || "";
-      const visAlt  = visible[iAlt]  || "";
+      // Q3 Age
+      if (h.includes("q3") && (h.includes("alter") || h.includes("age") || h.includes("altersgruppe"))) return "Q3_Age";
 
-      const mainLooksAndere = isAndereHeader(visMain);
-      const altLooksAndere  = isAndereHeader(visAlt);
+      // Q7
+      if (h.includes("q7") && h.includes("frisch"))     return "Q7_Essverhalten_Frischkaese";
+      if (h.includes("q7") && h.includes("gouda"))      return "Q7_Essverhalten_Gouda";
+      if (h.includes("q7") && (h.includes("butter") || h.includes("butterkäse"))) return "Q7_Essverhalten_Butterkaese";
+      if (h.includes("q7") && h.includes("camembert"))  return "Q7_Essverhalten_Camembert";
 
-      // Wenn die "Hauptmarke"-Spalte sichtbar als "Andere..." beschriftet ist → tauschen.
-      // Oder wenn die "Andere"-Spalte sichtbar NICHT nach "andere/keine/markenname" aussieht → tauschen.
-      if ((mainLooksAndere && !altLooksAndere) || (!mainLooksAndere && !altLooksAndere && visMain && visAlt)) {
-        [eff[iMain], eff[iAlt]] = [eff[iAlt], eff[iMain]];
+      // Q9
+      if (h.startsWith("q9") || h.includes("geschmacksrichtungen") || h.includes("lehne")) return "Q9_Ablehnung";
+
+      // Q10 Marke / Andere
+      if (h.includes("q10")) {
+        if (isQ10AndereHdr(txt)) return "Q10_Marke_Andere";
+        // Hauptmarke erkennen – möglichst großzügig:
+        if (h.includes("welches") || h.includes("produkt") || h.includes("verwenden") || h.includes("haupts") || h.includes("marke")) {
+          return "Q10_Marke";
+        }
       }
-      return eff;
+
+      // Q11 Fett
+      if (h.includes("q11") && h.includes("fett")) return "Q11_Fettgehalt";
+
+      // Fallback: falls headerOrder gegeben ist, probiere exakten Treffer (z. B. bereits „Q10_Marke“ als Klartext)
+      if (Array.isArray(headerOrder)) {
+        const direct = headerOrder.find(k => lc(k) === h);
+        if (direct) return direct;
+      }
+
+      // Unbekannt → nichts schreiben
+      return null;
     }
 
-    const effectiveHeaderOrder = adjustQ10OrderWithVisible(headerOrder, visibleHeaderTexts);
+    // Spaltenplan bauen (eine Position pro sichtbarer Spalte)
+    const columnPlan = visible.map(keyForHeaderText);
 
-    // ----- 4) Kopf+Breiten kopieren (für neue Sheets) -----
+    // ---- 5) Kopf und Breiten klonen (für neue Sheets) ----
     function cloneHeaderAndWidths(srcWs, dstWs) {
       for (let r = 1; r <= Math.max(1, dataStartRow - 1); r++) {
         const sRow = srcWs.getRow(r);
@@ -109,50 +133,36 @@ export default async function handler(req, res) {
       dstWs.columns = srcWs.columns.map(col => ({ width: col.width || 10 }));
     }
 
-    // ----- 5) Daten schreiben (streng nach effectiveHeaderOrder) -----
-    function isNumberingHeader(visible) {
-      const h = String(visible || "").toLowerCase().trim();
-      return ["anzahl", "no.", "no", "nr.", "nr"].includes(h);
-    }
-
-    function writeDataRows(ws, dataRows, effectiveOrder, visible) {
+    // ---- 6) Schreiben nach columnPlan ----
+    function writeDataRowsByPlan(ws, dataRows, plan) {
       if (!Array.isArray(dataRows) || !dataRows.length) return;
 
       const need = Math.max(0, dataRows.length - (ws.rowCount - (dataStartRow - 1)));
       if (need > 0) ws.duplicateRow(dataStartRow, need, true);
-
-      // Spalten, die Nummerierung zeigen sollen
-      const numberingByCol = [];
-      for (let c = 1; c <= effectiveOrder.length; c++) {
-        const keyLower = String(effectiveOrder[c-1] || "").toLowerCase();
-        const vis = visible[c-1] || null;
-        const looksNumberKey = ["anzahl","no.","no","nr.","nr"].includes(keyLower);
-        const looksNumberHdr = isNumberingHeader(vis);
-        numberingByCol[c] = looksNumberKey || looksNumberHdr;
-      }
 
       for (let i = 0; i < dataRows.length; i++) {
         const rowNum = dataStartRow + i;
         const dst = ws.getRow(rowNum);
         const src = dataRows[i] || {};
 
-        for (let c = 1; c <= effectiveOrder.length; c++) {
-          const key = effectiveOrder[c-1];
-          if (numberingByCol[c]) { dst.getCell(c).value = i + 1; continue; }
-          dst.getCell(c).value = (src[key] == null ? "" : src[key]);
+        for (let c = 1; c <= plan.length; c++) {
+          const key = plan[c-1];
+          if (key === "__NUM__") { dst.getCell(c).value = i + 1; continue; }
+          if (!key)             { dst.getCell(c).value = "";   continue; }
+          dst.getCell(c).value  = (src[key] == null ? "" : src[key]);
         }
         dst.commit();
       }
     }
 
-    // ----- 6) QA-Sheet (optional) -----
+    // ---- 7) QA-Sheet (optional) ----
     function buildQASheet(workbook, qaObj, name = "QA") {
       if (!qaObj || typeof qaObj !== "object") return;
       const ws = workbook.addWorksheet(name);
       let r = 1;
 
       ws.getCell(r,1).value = "QA Übersicht";
-      ws.getCell(r,1).font = { bold: true, size: 14 };
+      ws.getCell(r,1).font  = { bold: true, size: 14 };
       r += 2;
 
       ws.getCell(r,1).value = "Stichprobe";
@@ -168,33 +178,34 @@ export default async function handler(req, res) {
         ["Q7", qaObj.q7]
       ];
 
+      const putKV = (ws,r,k,v)=>{ ws.getCell(r,1).value=String(k); ws.getCell(r,2).value=(typeof v==="object")?JSON.stringify(v):v; return r+1; };
+
       for (const [title, obj] of blocks) {
         if (!obj || typeof obj !== "object") continue;
         ws.getCell(r,1).value = title;
-        ws.getCell(r,1).font = { bold: true };
+        ws.getCell(r,1).font  = { bold: true };
         r++;
-        const putKV = (k,v)=>{ ws.getCell(r,1).value = String(k); ws.getCell(r,2).value = (typeof v === "object") ? JSON.stringify(v) : v; r++; };
         if (title === "Brands (Soll/Ist/Diff)") {
-          putKV("soll", obj.soll);
-          putKV("soll_scaled", obj.soll_scaled);
-          putKV("ist", obj.ist);
-          putKV("diff", obj.diff);
-          putKV("pools", obj.pools);
+          r = putKV(ws,r,"soll",obj.soll);
+          r = putKV(ws,r,"soll_scaled",obj.soll_scaled);
+          r = putKV(ws,r,"ist",obj.ist);
+          r = putKV(ws,r,"diff",obj.diff);
+          r = putKV(ws,r,"pools",obj.pools);
           r++;
         } else if (title === "Q7") {
-          for (const [k,v] of Object.entries(obj)) putKV(k,v);
+          for (const [k,v] of Object.entries(obj)) r = putKV(ws,r,k,v);
           r++;
         } else {
-          for (const [k,v] of Object.entries(obj)) putKV(k,v);
+          for (const [k,v] of Object.entries(obj)) r = putKV(ws,r,k,v);
           r++;
         }
       }
     }
 
-    // ----- 7) Multi vs. Single -----
+    // ---- 8) Multi vs. Single ----
     if (Array.isArray(sheets) && sheets.length > 0) {
       // Erstes Sheet ins Template
-      writeDataRows(tplSheet, sheets[0]?.rows || [], effectiveHeaderOrder, visibleHeaderTexts);
+      writeDataRowsByPlan(tplSheet, sheets[0]?.rows || [], columnPlan);
       if (sheets[0]?.qa) buildQASheet(wb, sheets[0].qa, "QA");
 
       // Weitere Sheets
@@ -202,17 +213,17 @@ export default async function handler(req, res) {
         const el = sheets[i];
         const ws = wb.addWorksheet(String(el?.name || `Sheet_${i+1}`));
         cloneHeaderAndWidths(tplSheet, ws);
-        writeDataRows(ws, el?.rows || [], effectiveHeaderOrder, visibleHeaderTexts);
+        writeDataRowsByPlan(ws, el?.rows || [], columnPlan);
         if (el?.qa) buildQASheet(wb, el.qa, `QA_${el?.name || i+1}`);
       }
     } else if (Array.isArray(rows)) {
-      writeDataRows(tplSheet, rows, effectiveHeaderOrder, visibleHeaderTexts);
+      writeDataRowsByPlan(tplSheet, rows, columnPlan);
       if (qa) buildQASheet(wb, qa, "QA");
     } else {
       return res.status(400).json({ error: "Weder rows noch sheets übergeben." });
     }
 
-    // ----- 8) Datei zurückgeben -----
+    // ---- 9) Datei zurückgeben + Version ----
     const buf = await wb.xlsx.writeBuffer();
     const outB64 = Buffer.from(buf).toString("base64");
     const fileName =
@@ -220,7 +231,9 @@ export default async function handler(req, res) {
         ? `${prefix}_Festdaten_multi.xlsx`
         : `${prefix}_Festdaten.xlsx`;
 
-    return res.status(200).json({ file: outB64, fileName, success: true });
+    // Version sichtbar machen (Option A)
+    res.setHeader("X-Exporter-Version", "3.3");
+    return res.status(200).json({ file: outB64, fileName, success: true, version: "3.3" });
 
   } catch (err) {
     console.error("EXPORT XLSX ERROR", err);
