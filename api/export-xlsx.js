@@ -76,51 +76,99 @@ export default async function handler(req, res) {
       // Merges übernehmen (Header + ggf. Prototyp)
       copyMerges(srcWs, dstWs);
     }
+// innerhalb Deiner Route (wie zuvor geladen), nur die Schreiblogik ersetzen:
 
-    // Daten schreiben: ENTWEDER nach headerOrder (empfohlen) ODER heuristisch über Row 1
-    function writeDataRows(ws, dataRows, headerOrderOpt) {
-      if (!Array.isArray(dataRows) || dataRows.length === 0) return;
+// 1) Headerzeile lesen (Zeile 1) – fertige Liste der sichtbaren Spaltentitel
+function readHeaderTexts(ws) {
+  const headerRow = ws.getRow(1);
+  const texts = [];
+  for (let c = 1; c <= headerRow.cellCount; c++) {
+    const v = headerRow.getCell(c).value;
+    if (v == null || v === "") break;
+    texts.push(String(v));
+  }
+  return texts;
+}
 
-      let headers = null;
+// 2) Heuristisches Mapping: Header-Text -> Variablen-Key im Row-Objekt
+function makeHeaderToKeyMap(headerTexts) {
+  const map = new Map();
+  const norm = s => String(s || "").toLowerCase();
 
-      if (Array.isArray(headerOrderOpt) && headerOrderOpt.length) {
-        // feste Reihenfolge aus Template/Codebook
-        headers = headerOrderOpt.slice();
-      } else {
-        // Heuristik (Fallback): nimm die erste nicht-leere Zeile als Header
-        const headerRow = ws.getRow(1);
-        const h = [];
-        for (let c = 1; c <= headerRow.cellCount; c++) {
-          const v = headerRow.getCell(c).value;
-          if (v == null || v === "") break;
-          h.push(String(v));
-        }
-        headers = h;
-      }
+  for (let i = 0; i < headerTexts.length; i++) {
+    const h = headerTexts[i];
+    const H = norm(h);
 
-      if (!headers || headers.length === 0) throw new Error("Export: keine Header bestimmt (headerOrder übergeben!).");
+    // Direktmatches (häufige Fälle)
+    if (H === "anzahl")              { map.set(i+1, "Anzahl"); continue; }
+    if (H === "no." || H === "nr" || H === "nr.") { map.set(i+1, "No."); continue; }
 
-      // ggf. ausreichende Anzahl Datenzeilen (als Style‑Kopie der Prototyp‑Zeile) einfügen
-      const need = Math.max(0, dataRows.length - (ws.rowCount - (DATA_START - 1)));
-      if (need > 0) ws.duplicateRow(DATA_START, need, true);
-
-      // Zellen füllen – strikt nach Spaltenindex 1..headers.length
-      for (let i = 0; i < dataRows.length; i++) {
-        const src = dataRows[i] || {};
-        const rowNum = DATA_START + i;
-        const xRow = ws.getRow(rowNum);
-
-        for (let c = 1; c <= headers.length; c++) {
-          const header = headers[c - 1];
-          const cell = xRow.getCell(c);
-          // Wenn keys exakt dem Header entsprechen: direkt nehmen
-          // Falls deine Rows intern kürzere Keys benutzen, mappst du sie upstream.
-          const val = Object.prototype.hasOwnProperty.call(src, header) ? src[header] : "";
-          cell.value = (val == null ? "" : val);
-        }
-        xRow.commit();
-      }
+    // Q2 Gender
+    if (H.includes("q2") && (H.includes("gender") || H.includes("geschlecht"))) {
+      map.set(i+1, "Q2_Gender"); continue;
     }
+
+    // Q3 Age
+    if (H.includes("q3") && (H.includes("alter") || H.includes("altersgruppe") || H.includes("age"))) {
+      map.set(i+1, "Q3_Age"); continue;
+    }
+
+    // Q7 Essverhalten
+    if (H.includes("q7") && (H.includes("frischk")))   { map.set(i+1, "Q7_Essverhalten_Frischkaese"); continue; }
+    if (H.includes("q7") && (H.includes("gouda")))      { map.set(i+1, "Q7_Essverhalten_Gouda"); continue; }
+    if (H.includes("q7") && (H.includes("butterk")))    { map.set(i+1, "Q7_Essverhalten_Butterkaese"); continue; }
+    if (H.includes("q7") && (H.includes("camembert")))  { map.set(i+1, "Q7_Essverhalten_Camembert"); continue; }
+
+    // Q9 Ablehnung
+    if (H.includes("q9") && (H.includes("lehne") || H.includes("ablehn"))) {
+      map.set(i+1, "Q9_Ablehnung"); continue;
+    }
+
+    // Q10 Marke & Freitext
+    if (H.includes("q10") && (H.includes("haupt") || H.includes("produkt") || H.includes("verwenden"))) {
+      map.set(i+1, "Q10_Marke"); continue;
+    }
+    if (H.includes("q10") && (H.includes("keine") || H.includes("sondern") || H.includes("markenname") || H.includes("andere"))) {
+      map.set(i+1, "Q10_Marke_Andere"); continue;
+    }
+
+    // Q11 Fettgehalt
+    if ((H.includes("q11") && H.includes("fett")) || H.includes("q11_fettgehalt")) {
+      map.set(i+1, "Q11_Fettgehalt"); continue;
+    }
+
+    // Fallback: Wenn Header exakt ein bekannter Variablenname ist (selten, aber möglich)
+    const guess = h.replace(/\./g, "_").replace(/\s+/g,"_"); // z.B. "Q2.Gender" -> "Q2_Gender"
+    map.set(i+1, guess);
+  }
+  return map;
+}
+
+// 3) Schreiben mit Mapping, ab Zeile 4
+function writeDataRowsByHeader(ws, dataRows, dataStartRow = 4) {
+  if (!Array.isArray(dataRows) || dataRows.length === 0) return;
+
+  const headerTexts = readHeaderTexts(ws);
+  if (!headerTexts.length) throw new Error("Export: Headerzeile (Row 1) leer.");
+  const h2k = makeHeaderToKeyMap(headerTexts);
+
+  // ggf. genügend Datenzeilen „mit Stil“ vorbereiten (Zeile 4 als Prototyp)
+  const need = Math.max(0, dataRows.length - (ws.rowCount - (dataStartRow - 1)));
+  if (need > 0) ws.duplicateRow(dataStartRow, need, true);
+
+  for (let i = 0; i < dataRows.length; i++) {
+    const src = dataRows[i] || {};
+    const rowNum = dataStartRow + i;
+    const xRow = ws.getRow(rowNum);
+
+    for (let c = 1; c <= headerTexts.length; c++) {
+      const key = h2k.get(c);                    // Variablen-Schlüssel
+      const val = (key && Object.prototype.hasOwnProperty.call(src, key)) ? src[key] : "";
+      xRow.getCell(c).value = (val == null ? "" : val);
+    }
+    xRow.commit();
+  }
+}
 
     // QA‑Sheet (wie zuvor)
     function buildQASheet(workbook, qaObj, name = "QA") {
