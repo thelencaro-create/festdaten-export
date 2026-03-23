@@ -1,6 +1,6 @@
 // /api/export-xlsx.js
-// v4.2 — Multi‑Sheet SUPPORT, robustes JSON‑Parsing, voller Logging-Support,
-//        kein .values mehr, KEIN duplicateRow() (schreibt Zeilen direkt)
+// v4.3 — Multi‑Sheet SUPPORT, robustes JSON‑Parsing & Logging,
+//        kein duplicateRow(), Fallback auf headerOrder wenn sichtbare Header nicht gemappt werden.
 import ExcelJS from "exceljs";
 
 export const config = {
@@ -48,9 +48,9 @@ export default async function handler(req, res) {
     // ----------------------------------------------------------
     const {
       templateBase64,
-      rows, // optional (single sheet)
-      qa,   // optional (single QA)
-      sheets, // MULTI-SHEET [{ name, rows, qa }]
+      rows,      // optional (single sheet)
+      qa,        // optional (single QA)
+      sheets,    // MULTI-SHEET [{ name, rows, qa }]
       prefix = "SITE",
       headerOrder = [],
       dataStartRow = 4,
@@ -64,14 +64,12 @@ export default async function handler(req, res) {
     // 2) TEMPLATE LADEN
     // ----------------------------------------------------------
     const wb = new ExcelJS.Workbook();
-
     const tplBuf = Buffer.from(
       String(templateBase64).includes("base64,")
         ? String(templateBase64).split("base64,").pop()
         : String(templateBase64),
       "base64"
     );
-
     await wb.xlsx.load(tplBuf);
 
     const tplSheet = wb.worksheets[0];
@@ -80,7 +78,7 @@ export default async function handler(req, res) {
     }
 
     // ----------------------------------------------------------
-    // 3) VISIBLE HEADERS (Spalten der ersten Zeile)
+    // 3) VISIBLE HEADERS (erste Zeile)
     // ----------------------------------------------------------
     function readVisibleHeaders(ws) {
       const headerRow = ws.getRow(1);
@@ -92,15 +90,14 @@ export default async function handler(req, res) {
       }
       return out;
     }
-
     const visibleHeaders = readVisibleHeaders(tplSheet);
+    console.log("VISIBLE HEADERS:", visibleHeaders);
 
     // ----------------------------------------------------------
-    // 4) HEADER → KEY MAPPING
+    // 4) HEADER → KEY MAPPING (sichtbare Header first, Fallback: headerOrder)
     // ----------------------------------------------------------
     const lc = (s) => String(s || "").toLowerCase().trim();
-    const isNum = (h) =>
-      ["no.", "nr.", "no", "nr", "anzahl"].includes(lc(h));
+    const isNum = (h) => ["no.", "nr.", "no", "nr", "anzahl"].includes(lc(h));
     const isQ10Andere = (h) =>
       lc(h).includes("andere") ||
       lc(h).includes("keine") ||
@@ -148,13 +145,22 @@ export default async function handler(req, res) {
         if (direct) return direct;
       }
 
-      return null;
+      return null; // unbekannter Header
     }
 
-    const columnPlan = visibleHeaders.map(keyForHeaderText);
+    // Erster Versuch: sichtbare Header → Keys
+    const columnPlanFromVisible = visibleHeaders.map(keyForHeaderText);
+    const hasAnyMapping = columnPlanFromVisible.some(k => k && k !== "__NUM__");
+
+    // Fallback: wenn NICHTS erkannt wurde, nimm headerOrder exakt
+    const plan = hasAnyMapping && columnPlanFromVisible.length
+      ? columnPlanFromVisible
+      : (Array.isArray(headerOrder) && headerOrder.length ? headerOrder.slice() : columnPlanFromVisible);
+
+    console.log("COLUMN PLAN (first 20):", plan.slice(0, 20));
 
     // ----------------------------------------------------------
-    // 5) HEADER + FORMAT KOPIEREN (Zeilen < dataStartRow)
+    // 5) Überschriften+Formate Zeilen < dataStartRow kopieren
     // ----------------------------------------------------------
     function cloneHeaderAndWidths(src, dst) {
       for (let r = 1; r < dataStartRow; r++) {
@@ -183,14 +189,11 @@ export default async function handler(req, res) {
     }
 
     // ----------------------------------------------------------
-    // 6) DATA WRITER — OHNE duplicateRow()
-    //    (legt Zeilen direkt an; kopiert optional Stil aus Musterzeile,
-    //     falls dataStartRow im Template existiert)
+    // 6) DATA WRITER — ohne duplicateRow(), mit optionalem Stil‑Copy
     // ----------------------------------------------------------
-    function writeDataRowsByPlan(ws, dataRows, plan) {
+    function writeDataRowsByPlan(ws, dataRows, planArr) {
       if (!Array.isArray(dataRows) || !dataRows.length) return;
 
-      // Optionale Musterzeile (falls im Template vorhanden)
       const sampleExists = Boolean(ws._rows?.[dataStartRow - 1]);
       const sampleRow = sampleExists ? ws.getRow(dataStartRow) : null;
 
@@ -199,11 +202,12 @@ export default async function handler(req, res) {
         const dst = ws.getRow(rowNum);
         const src = dataRows[i] || {};
 
-        for (let c = 1; c <= plan.length; c++) {
-          const key = plan[c - 1];
+        const cols = planArr.length; // so viele Spalten wie im Plan
+        for (let c = 1; c <= cols; c++) {
+          const key = planArr[c - 1];
           const dCell = dst.getCell(c);
 
-          // Minimalen Stil aus der Musterzeile kopieren (sofern vorhanden)
+          // Stil aus Musterzeile kopieren (wenn vorhanden)
           if (sampleRow) {
             const sCell = sampleRow.getCell(c);
             if (sCell.style) dCell.style = { ...sCell.style };
@@ -228,7 +232,7 @@ export default async function handler(req, res) {
     }
 
     // ----------------------------------------------------------
-    // 7) QA SHEET (OPTIONAL)
+    // 7) QA SHEET (optional)
     // ----------------------------------------------------------
     function buildQASheet(workbook, qaObj, name = "QA") {
       if (!qaObj || typeof qaObj !== "object") return;
@@ -249,35 +253,27 @@ export default async function handler(req, res) {
     }
 
     // ----------------------------------------------------------
-    // 8) MULTI-SHEET HANDLING
+    // 8) MULTI / SINGLE
     // ----------------------------------------------------------
     cloneHeaderAndWidths(tplSheet, tplSheet);
 
     if (Array.isArray(sheets) && sheets.length > 0) {
       // Erstes Sheet ins Template
-      writeDataRowsByPlan(tplSheet, sheets[0]?.rows ?? [], columnPlan);
+      writeDataRowsByPlan(tplSheet, sheets[0]?.rows ?? [], plan);
       if (sheets[0]?.qa) buildQASheet(wb, sheets[0].qa, "QA");
 
-      // Weitere Sheets erzeugen
+      // Weitere Sheets
       for (let i = 1; i < sheets.length; i++) {
         const el = sheets[i];
         const ws = wb.addWorksheet(String(el?.name || `Sheet_${i + 1}`));
-
         cloneHeaderAndWidths(tplSheet, ws);
-        writeDataRowsByPlan(ws, el?.rows ?? [], columnPlan);
-
+        writeDataRowsByPlan(ws, el?.rows ?? [], plan);
         if (el?.qa) buildQASheet(wb, el.qa, `QA_${el?.name || i + 1}`);
       }
-    }
-    // ----------------------------------------------------------
-    // 8b) SINGLE SHEET FALLBACK
-    // ----------------------------------------------------------
-    else if (Array.isArray(rows)) {
-      writeDataRowsByPlan(tplSheet, rows, columnPlan);
+    } else if (Array.isArray(rows)) {
+      writeDataRowsByPlan(tplSheet, rows, plan);
       if (qa) buildQASheet(wb, qa, "QA");
-    }
-
-    else {
+    } else {
       return res.status(400).json({ error: "Weder rows noch sheets übergeben." });
     }
 
@@ -292,12 +288,12 @@ export default async function handler(req, res) {
         ? `${prefix}_Festdaten_multi.xlsx`
         : `${prefix}_Festdaten.xlsx`;
 
-    res.setHeader("X-Exporter-Version", "4.2");
+    res.setHeader("X-Exporter-Version", "4.3");
     return res.status(200).json({
       file: outB64,
       fileName,
       success: true,
-      version: "4.2",
+      version: "4.3",
     });
 
   } catch (err) {
