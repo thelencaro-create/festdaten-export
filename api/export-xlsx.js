@@ -1,5 +1,6 @@
 // /api/export-xlsx.js
-// v4.1 — Multi‑Sheet SUPPORT, robustes JSON‑Parsing, voller Logging-Support, kein .values mehr
+// v4.2 — Multi‑Sheet SUPPORT, robustes JSON‑Parsing, voller Logging-Support,
+//        kein .values mehr, KEIN duplicateRow() (schreibt Zeilen direkt)
 import ExcelJS from "exceljs";
 
 export const config = {
@@ -48,7 +49,7 @@ export default async function handler(req, res) {
     const {
       templateBase64,
       rows, // optional (single sheet)
-      qa, // optional (single QA)
+      qa,   // optional (single QA)
       sheets, // MULTI-SHEET [{ name, rows, qa }]
       prefix = "SITE",
       headerOrder = [],
@@ -79,7 +80,7 @@ export default async function handler(req, res) {
     }
 
     // ----------------------------------------------------------
-    // 3) VISIBLE HEADERS (Spalten der ersten Reihe)
+    // 3) VISIBLE HEADERS (Spalten der ersten Zeile)
     // ----------------------------------------------------------
     function readVisibleHeaders(ws) {
       const headerRow = ws.getRow(1);
@@ -125,11 +126,7 @@ export default async function handler(req, res) {
       if (h.includes("q7") && h.includes("camembert"))
         return "Q7_Essverhalten_Camembert";
 
-      if (
-        h.startsWith("q9") ||
-        h.includes("geschmack") ||
-        h.includes("lehne")
-      )
+      if (h.startsWith("q9") || h.includes("geschmack") || h.includes("lehne"))
         return "Q9_Ablehnung";
 
       if (h.includes("q10")) {
@@ -157,7 +154,7 @@ export default async function handler(req, res) {
     const columnPlan = visibleHeaders.map(keyForHeaderText);
 
     // ----------------------------------------------------------
-    // 5) HEADER + FORMAT COPYING
+    // 5) HEADER + FORMAT KOPIEREN (Zeilen < dataStartRow)
     // ----------------------------------------------------------
     function cloneHeaderAndWidths(src, dst) {
       for (let r = 1; r < dataStartRow; r++) {
@@ -186,35 +183,44 @@ export default async function handler(req, res) {
     }
 
     // ----------------------------------------------------------
-    // 6) ROW WRITER (ohne .values !!!)
+    // 6) DATA WRITER — OHNE duplicateRow()
+    //    (legt Zeilen direkt an; kopiert optional Stil aus Musterzeile,
+    //     falls dataStartRow im Template existiert)
     // ----------------------------------------------------------
     function writeDataRowsByPlan(ws, dataRows, plan) {
       if (!Array.isArray(dataRows) || !dataRows.length) return;
 
-      const required = dataRows.length + (dataStartRow - 1);
-      if (ws.rowCount < required) {
-        ws.duplicateRow(dataStartRow, dataRows.length, true);
-      }
+      // Optionale Musterzeile (falls im Template vorhanden)
+      const sampleExists = Boolean(ws._rows?.[dataStartRow - 1]);
+      const sampleRow = sampleExists ? ws.getRow(dataStartRow) : null;
 
       for (let i = 0; i < dataRows.length; i++) {
-        const rowIndex = dataStartRow + i;
-        const dst = ws.getRow(rowIndex);
+        const rowNum = dataStartRow + i;
+        const dst = ws.getRow(rowNum);
         const src = dataRows[i] || {};
 
         for (let c = 1; c <= plan.length; c++) {
           const key = plan[c - 1];
+          const dCell = dst.getCell(c);
+
+          // Minimalen Stil aus der Musterzeile kopieren (sofern vorhanden)
+          if (sampleRow) {
+            const sCell = sampleRow.getCell(c);
+            if (sCell.style) dCell.style = { ...sCell.style };
+            if (sCell.font) dCell.font = { ...sCell.font };
+            if (sCell.alignment) dCell.alignment = { ...sCell.alignment };
+            if (sCell.border) dCell.border = { ...sCell.border };
+            if (sCell.fill) dCell.fill = { ...sCell.fill };
+            if (sCell.numFmt) dCell.numFmt = sCell.numFmt;
+          }
 
           if (key === "__NUM__") {
-            dst.getCell(c).value = i + 1;
-            continue;
+            dCell.value = i + 1;
+          } else if (!key) {
+            dCell.value = "";
+          } else {
+            dCell.value = src[key] ?? "";
           }
-
-          if (!key) {
-            dst.getCell(c).value = "";
-            continue;
-          }
-
-          dst.getCell(c).value = src[key] ?? "";
         }
 
         dst.commit();
@@ -245,12 +251,14 @@ export default async function handler(req, res) {
     // ----------------------------------------------------------
     // 8) MULTI-SHEET HANDLING
     // ----------------------------------------------------------
+    cloneHeaderAndWidths(tplSheet, tplSheet);
+
     if (Array.isArray(sheets) && sheets.length > 0) {
       // Erstes Sheet ins Template
       writeDataRowsByPlan(tplSheet, sheets[0]?.rows ?? [], columnPlan);
       if (sheets[0]?.qa) buildQASheet(wb, sheets[0].qa, "QA");
 
-      // Weitere Sheets klonen
+      // Weitere Sheets erzeugen
       for (let i = 1; i < sheets.length; i++) {
         const el = sheets[i];
         const ws = wb.addWorksheet(String(el?.name || `Sheet_${i + 1}`));
@@ -261,7 +269,6 @@ export default async function handler(req, res) {
         if (el?.qa) buildQASheet(wb, el.qa, `QA_${el?.name || i + 1}`);
       }
     }
-
     // ----------------------------------------------------------
     // 8b) SINGLE SHEET FALLBACK
     // ----------------------------------------------------------
@@ -285,12 +292,12 @@ export default async function handler(req, res) {
         ? `${prefix}_Festdaten_multi.xlsx`
         : `${prefix}_Festdaten.xlsx`;
 
-    res.setHeader("X-Exporter-Version", "4.1");
+    res.setHeader("X-Exporter-Version", "4.2");
     return res.status(200).json({
       file: outB64,
       fileName,
       success: true,
-      version: "4.1",
+      version: "4.2",
     });
 
   } catch (err) {
