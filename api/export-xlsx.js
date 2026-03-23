@@ -13,12 +13,14 @@ export default async function handler(req, res) {
 
     // ---- 0) BODY LOADING (supports raw string or JSON obj) ----
     const raw = req.body;
+    console.log("RAW BODY RECEIVED:", JSON.stringify(raw, null, 2));
     const body =
       typeof raw === "string"
         ? JSON.parse(raw)
         : raw && typeof raw === "object"
         ? raw
         : {};
+      console.log("PARSED BODY:", JSON.stringify(body, null, 2
 
     const {
       templateBase64,
