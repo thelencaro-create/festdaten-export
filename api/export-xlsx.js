@@ -1,6 +1,18 @@
-// /api/export-xlsx.js
-// v4.3 — Multi‑Sheet SUPPORT, robustes JSON‑Parsing & Logging,
-//        kein duplicateRow(), Fallback auf headerOrder wenn sichtbare Header nicht gemappt werden.
+/*********************************************************************
+ * EXPORT XLSX v5.0 — KOMPLETTER END-TO-END EXPORTER
+ *
+ *  ✔ Sheet 1  = Hamburg (oder anderer sheetName)
+ *               → Kompakt wie QA, keine Template-Texte
+ *               → Nur Datenzeilen
+ *
+ *  ✔ Sheet 2  = QA
+ *               → Soll / Ist / Diff
+ *               → sauber formatiert
+ *
+ *  ✔ Alle Werte STRING -> keine leeren Zellen
+ *  ✔ Kein Template-Duplikat, keine "1 = männlich"-Rows usw.
+*********************************************************************/
+
 import ExcelJS from "exceljs";
 
 export const config = {
@@ -13,291 +25,161 @@ export default async function handler(req, res) {
       return res.status(405).json({ error: "Method not allowed" });
     }
 
-    // ----------------------------------------------------------
-    // 0) BODY LOADING + LOGGING
-    // ----------------------------------------------------------
+    // Body sicher laden
     const raw = req.body;
+    const body =
+      typeof raw === "string"
+        ? JSON.parse(raw)
+        : raw && typeof raw === "object"
+        ? raw
+        : {};
 
-    console.log("RAW BODY RECEIVED TYPE:", typeof raw);
-    if (typeof raw === "string") {
-      console.log("RAW BODY STRING (first 500 chars):", raw.slice(0, 500));
-    } else {
-      console.log("RAW BODY OBJECT KEYS:", raw ? Object.keys(raw) : null);
-    }
-
-    let body;
-    try {
-      body =
-        typeof raw === "string"
-          ? JSON.parse(raw)
-          : raw && typeof raw === "object"
-          ? raw
-          : {};
-    } catch (e) {
-      console.error("JSON.parse FAILED:", e?.message);
-      return res.status(400).json({
-        error: "Invalid JSON body",
-        detail: String(e?.message ?? e),
-      });
-    }
-
-    console.log("PARSED BODY:", JSON.stringify(body, null, 2));
-
-    // ----------------------------------------------------------
-    // 1) BODY ENTPACKEN
-    // ----------------------------------------------------------
     const {
-      templateBase64,
-      rows,      // optional (single sheet)
-      qa,        // optional (single QA)
-      sheets,    // MULTI-SHEET [{ name, rows, qa }]
+      rows = [],              // → 125 Datenzeilen (Personas)
+      column_order = [],      // → Reihenfolge wie Q2_Gender usw.
+      sheetName = "Hamburg",  // → Hauptdatenblatt
       prefix = "SITE",
-      headerOrder = [],
-      dataStartRow = 4,
+      targetsSummary = null   // → QA-Daten aus deinem Screener-Parser
     } = body;
 
-    if (!templateBase64) {
-      return res.status(400).json({ error: "templateBase64 fehlt" });
+    if (!Array.isArray(rows)) {
+      return res.status(400).json({ error: "rows must be array" });
+    }
+    if (!Array.isArray(column_order) || !column_order.length) {
+      return res.status(400).json({ error: "column_order missing" });
     }
 
-    // ----------------------------------------------------------
-    // 2) TEMPLATE LADEN
-    // ----------------------------------------------------------
+    /******************************************************************
+     * WORKBOOK
+     ******************************************************************/
     const wb = new ExcelJS.Workbook();
-    const tplBuf = Buffer.from(
-      String(templateBase64).includes("base64,")
-        ? String(templateBase64).split("base64,").pop()
-        : String(templateBase64),
-      "base64"
-    );
-    await wb.xlsx.load(tplBuf);
 
-    const tplSheet = wb.worksheets[0];
-    if (!tplSheet) {
-      return res.status(400).json({ error: "Kein Worksheet im Template" });
-    }
+    /******************************************************************
+     * SHEET 1 — DATENBLATT (kompakt wie QA)
+     ******************************************************************/
+    const wsData = wb.addWorksheet(sheetName);
 
-    // ----------------------------------------------------------
-    // 3) VISIBLE HEADERS (erste Zeile)
-    // ----------------------------------------------------------
-    function readVisibleHeaders(ws) {
-      const headerRow = ws.getRow(1);
-      const out = [];
-      for (let c = 1; c <= headerRow.cellCount; c++) {
-        const v = headerRow.getCell(c).value;
-        if (!v) break;
-        out.push(String(v));
-      }
-      return out;
-    }
-    const visibleHeaders = readVisibleHeaders(tplSheet);
-    console.log("VISIBLE HEADERS:", visibleHeaders);
+    // Kopfzeile: Anzahl + alle Variablen + No.
+    const header = ["Anzahl", ...column_order, "No."];
+    const hdr = wsData.addRow(header);
 
-    // ----------------------------------------------------------
-    // 4) HEADER → KEY MAPPING (sichtbare Header first, Fallback: headerOrder)
-    // ----------------------------------------------------------
-    const lc = (s) => String(s || "").toLowerCase().trim();
-    const isNum = (h) => ["no.", "nr.", "no", "nr", "anzahl"].includes(lc(h));
-    const isQ10Andere = (h) =>
-      lc(h).includes("andere") ||
-      lc(h).includes("keine") ||
-      lc(h).includes("markenname");
+    hdr.eachCell((c) => {
+      c.font = { bold: true };
+      c.alignment = { vertical: "middle", horizontal: "center" };
+      c.border = {
+        top: { style: "thin" },
+        left: { style: "thin" },
+        right: { style: "thin" },
+        bottom: { style: "thin" },
+      };
+    });
 
-    function keyForHeaderText(txt) {
-      const h = lc(txt);
+    // Datenzeilen
+    rows.forEach((row, i) => {
+      const line = [
+        String(i + 1),
+        ...column_order.map((key) => String(row?.[key] ?? "")),
+        String(i + 1),
+      ];
 
-      if (isNum(txt)) return "__NUM__";
+      const xlRow = wsData.addRow(line);
+      xlRow.eachCell((c) => {
+        c.alignment = { vertical: "middle", horizontal: "center" };
+        c.border = {
+          top: { style: "thin" },
+          left: { style: "thin" },
+          right: { style: "thin" },
+          bottom: { style: "thin" },
+        };
+      });
+    });
 
-      if (h.includes("q2") && (h.includes("gender") || h.includes("geschlecht")))
-        return "Q2_Gender";
+    wsData.columns.forEach((col) => (col.width = 16));
 
-      if (h.includes("q3") && (h.includes("age") || h.includes("alter")))
-        return "Q3_Age";
+    /******************************************************************
+     * SHEET 2 — QA (Soll / Ist / Diff)
+     ******************************************************************/
+    const wsQA = wb.addWorksheet("QA");
 
-      if (h.includes("q7") && h.includes("frisch"))
-        return "Q7_Essverhalten_Frischkaese";
-      if (h.includes("q7") && h.includes("gouda"))
-        return "Q7_Essverhalten_Gouda";
-      if (h.includes("q7") && (h.includes("butter") || h.includes("butterkäse")))
-        return "Q7_Essverhalten_Butterkaese";
-      if (h.includes("q7") && h.includes("camembert"))
-        return "Q7_Essverhalten_Camembert";
+    // Kopf „QA sheet“
+    const qaHeader = ["Variable", "Code", "Soll", "Ist", "Diff", "Notes"];
+    const qhRow = wsQA.addRow(qaHeader);
 
-      if (h.startsWith("q9") || h.includes("geschmack") || h.includes("lehne"))
-        return "Q9_Ablehnung";
+    qhRow.eachCell((c) => {
+      c.font = { bold: true };
+      c.alignment = { vertical: "middle", horizontal: "center" };
+      c.border = {
+        top: { style: "thin" },
+        left: { style: "thin" },
+        right: { style: "thin" },
+        bottom: { style: "thin" },
+      };
+    });
 
-      if (h.includes("q10")) {
-        if (isQ10Andere(txt)) return "Q10_Marke_Andere";
-        if (
-          h.includes("welches") ||
-          h.includes("haupt") ||
-          h.includes("marke") ||
-          h.includes("produkt")
-        )
-          return "Q10_Marke";
-      }
+    if (targetsSummary && typeof targetsSummary === "object") {
+      const blocks = Object.entries(targetsSummary);
 
-      if (h.includes("q11") && h.includes("fett")) return "Q11_Fettgehalt";
+      for (const [section, info] of blocks) {
+        if (section === "fallzahl") continue; // reine Meta-Info
 
-      // Fallback: exakter Treffer aus headerOrder
-      if (Array.isArray(headerOrder)) {
-        const direct = headerOrder.find((k) => lc(k) === h);
-        if (direct) return direct;
-      }
+        if (!info || typeof info !== "object") continue;
+        const soll = info.values || {};
+        const ist  = info.ist    || {};
+        const diff = {};
 
-      return null; // unbekannter Header
-    }
+        Object.keys({ ...soll, ...ist }).forEach((code) => {
+          diff[code] = (Number(ist[code] ?? 0) - Number(soll[code] ?? 0));
+        });
 
-    // Erster Versuch: sichtbare Header → Keys
-    const columnPlanFromVisible = visibleHeaders.map(keyForHeaderText);
-    const hasAnyMapping = columnPlanFromVisible.some(k => k && k !== "__NUM__");
+        // Abschnittsname
+        const sec = wsQA.addRow([section.toUpperCase()]);
+        sec.font = { bold: true };
+        sec.eachCell((c) => {
+          c.alignment = { vertical: "middle", horizontal: "left" };
+        });
 
-    // Fallback: wenn NICHTS erkannt wurde, nimm headerOrder exakt
-    const plan = hasAnyMapping && columnPlanFromVisible.length
-      ? columnPlanFromVisible
-      : (Array.isArray(headerOrder) && headerOrder.length ? headerOrder.slice() : columnPlanFromVisible);
+        // Wertezeilen
+        Object.keys({ ...soll, ...ist }).forEach((code) => {
+          const row = wsQA.addRow([
+            section,
+            code,
+            String(soll[code] ?? 0),
+            String(ist[code] ?? 0),
+            String(diff[code] ?? 0),
+            Array.isArray(info.notes) ? info.notes.join("; ") : ""
+          ]);
 
-    console.log("COLUMN PLAN (first 20):", plan.slice(0, 20));
+          row.eachCell((c) => {
+            c.alignment = { vertical: "middle", horizontal: "center" };
+            c.border = {
+              top: { style: "thin" },
+              left: { style: "thin" },
+              right: { style: "thin" },
+              bottom: { style: "thin" },
+            };
+          });
+        });
 
-    // ----------------------------------------------------------
-    // 5) Überschriften+Formate Zeilen < dataStartRow kopieren
-    // ----------------------------------------------------------
-    function cloneHeaderAndWidths(src, dst) {
-      for (let r = 1; r < dataStartRow; r++) {
-        const sRow = src.getRow(r);
-        const dRow = dst.getRow(r);
-
-        for (let c = 1; c <= sRow.cellCount; c++) {
-          const sCell = sRow.getCell(c);
-          const dCell = dRow.getCell(c);
-
-          dCell.value = sCell.value;
-          if (sCell.style) dCell.style = { ...sCell.style };
-          if (sCell.font) dCell.font = { ...sCell.font };
-          if (sCell.alignment) dCell.alignment = { ...sCell.alignment };
-          if (sCell.border) dCell.border = { ...sCell.border };
-          if (sCell.fill) dCell.fill = { ...sCell.fill };
-          if (sCell.numFmt) dCell.numFmt = sCell.numFmt;
-        }
-
-        dRow.commit();
-      }
-
-      dst.columns = src.columns.map((col) => ({
-        width: col.width || 10,
-      }));
-    }
-
-    // ----------------------------------------------------------
-    // 6) DATA WRITER — ohne duplicateRow(), mit optionalem Stil‑Copy
-    // ----------------------------------------------------------
-    function writeDataRowsByPlan(ws, dataRows, planArr) {
-      if (!Array.isArray(dataRows) || !dataRows.length) return;
-
-      const sampleExists = Boolean(ws._rows?.[dataStartRow - 1]);
-      const sampleRow = sampleExists ? ws.getRow(dataStartRow) : null;
-
-      for (let i = 0; i < dataRows.length; i++) {
-        const rowNum = dataStartRow + i;
-        const dst = ws.getRow(rowNum);
-        const src = dataRows[i] || {};
-
-        const cols = planArr.length; // so viele Spalten wie im Plan
-        for (let c = 1; c <= cols; c++) {
-          const key = planArr[c - 1];
-          const dCell = dst.getCell(c);
-
-          // Stil aus Musterzeile kopieren (wenn vorhanden)
-          if (sampleRow) {
-            const sCell = sampleRow.getCell(c);
-            if (sCell.style) dCell.style = { ...sCell.style };
-            if (sCell.font) dCell.font = { ...sCell.font };
-            if (sCell.alignment) dCell.alignment = { ...sCell.alignment };
-            if (sCell.border) dCell.border = { ...sCell.border };
-            if (sCell.fill) dCell.fill = { ...sCell.fill };
-            if (sCell.numFmt) dCell.numFmt = sCell.numFmt;
-          }
-
-          if (key === "__NUM__") {
-            dCell.value = i + 1;
-          } else if (!key) {
-            dCell.value = "";
-          } else {
-            dCell.value = src[key] ?? "";
-          }
-        }
-
-        dst.commit();
+        wsQA.addRow([]); // Leerzeile
       }
     }
 
-    // ----------------------------------------------------------
-    // 7) QA SHEET (optional)
-    // ----------------------------------------------------------
-    function buildQASheet(workbook, qaObj, name = "QA") {
-      if (!qaObj || typeof qaObj !== "object") return;
+    wsQA.columns.forEach((col) => (col.width = 18));
 
-      const ws = workbook.addWorksheet(name);
-      let r = 1;
-
-      ws.getCell(r, 1).value = "QA Übersicht";
-      ws.getCell(r, 1).font = { bold: true, size: 14 };
-      r += 2;
-
-      for (const [k, v] of Object.entries(qaObj)) {
-        ws.getCell(r, 1).value = k;
-        ws.getCell(r, 2).value =
-          typeof v === "object" ? JSON.stringify(v) : String(v);
-        r++;
-      }
-    }
-
-    // ----------------------------------------------------------
-    // 8) MULTI / SINGLE
-    // ----------------------------------------------------------
-    cloneHeaderAndWidths(tplSheet, tplSheet);
-
-    if (Array.isArray(sheets) && sheets.length > 0) {
-      // Erstes Sheet ins Template
-      writeDataRowsByPlan(tplSheet, sheets[0]?.rows ?? [], plan);
-      if (sheets[0]?.qa) buildQASheet(wb, sheets[0].qa, "QA");
-
-      // Weitere Sheets
-      for (let i = 1; i < sheets.length; i++) {
-        const el = sheets[i];
-        const ws = wb.addWorksheet(String(el?.name || `Sheet_${i + 1}`));
-        cloneHeaderAndWidths(tplSheet, ws);
-        writeDataRowsByPlan(ws, el?.rows ?? [], plan);
-        if (el?.qa) buildQASheet(wb, el.qa, `QA_${el?.name || i + 1}`);
-      }
-    } else if (Array.isArray(rows)) {
-      writeDataRowsByPlan(tplSheet, rows, plan);
-      if (qa) buildQASheet(wb, qa, "QA");
-    } else {
-      return res.status(400).json({ error: "Weder rows noch sheets übergeben." });
-    }
-
-    // ----------------------------------------------------------
-    // 9) RETURN FILE
-    // ----------------------------------------------------------
+    /******************************************************************
+     * EXPORT
+     ******************************************************************/
     const buf = await wb.xlsx.writeBuffer();
-    const outB64 = Buffer.from(buf).toString("base64");
 
-    const fileName =
-      Array.isArray(sheets) && sheets.length > 1
-        ? `${prefix}_Festdaten_multi.xlsx`
-        : `${prefix}_Festdaten.xlsx`;
-
-    res.setHeader("X-Exporter-Version", "4.3");
     return res.status(200).json({
-      file: outB64,
-      fileName,
+      file: Buffer.from(buf).toString("base64"),
+      fileName: `${prefix}_Festdaten.xlsx`,
       success: true,
-      version: "4.3",
+      version: "5.0",
     });
 
   } catch (err) {
-    console.error("EXPORT XLSX ERROR", err);
+    console.error("EXPORT ERROR", err);
     return res.status(500).json({ error: String(err?.message || err) });
   }
 }
