@@ -18,7 +18,6 @@ export default async function handler(req, res) {
       rows = [],
       column_order = [],
       prefix = "SITE",
-      fallzahl = null,
     } = body;
 
     if (!templateBase64) {
@@ -31,49 +30,65 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "column_order missing" });
     }
 
-    /************************************************************
-     * 1️⃣ TEMPLATE EINLESEN
-     ************************************************************/
+    /***********************************************
+     * TEMPLATE LADEN
+     ***********************************************/
     const buffer = Buffer.from(templateBase64, "base64");
-
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.load(buffer);
 
-    // Sheet 1 ist das Template
     const ws = wb.worksheets[0];
 
-    /************************************************************
-     * 2️⃣ DATEN INS TEMPLATE SCHREIBEN
-     *    (KEINE Formatierung, KEIN Styling, KEIN Reset)
-     ************************************************************/
-    // Wir gehen davon aus, dass DEIN TEMPLATE bereits
-    // die Header stehen hat und Row-Start klar ist.
+    /***********************************************
+     * HEADER-SPALTEN AUS TEMPLATE AUSLESEN
+     ***********************************************/
+    const headerRow = ws.getRow(1);
+    const colMap = {};  // key → Spaltenindex
 
-    let startRow = 2; // Beispiel: nach Header
-    rows.forEach((row, idx) => {
-      const excelRow = ws.getRow(startRow + idx);
-
-      column_order.forEach((key, colIndex) => {
-        excelRow.getCell(colIndex + 1).value = row[key] ?? "";
-      });
-
-      excelRow.commit();
+    headerRow.eachCell((cell, colNumber) => {
+      const header = String(cell.value).trim();
+      colMap[header] = colNumber;
     });
 
-    /************************************************************
-     * 3️⃣ KEIN QA-SHEET! — das macht n8n ab jetzt.
-     ************************************************************/
+    /***********************************************
+     * STARTROW AUTOMATISCH FINDEN (erste leere Zeile nach Header)
+     ***********************************************/
+    let startRow = 2;
 
-    /************************************************************
-     * 4️⃣ RETURN ALS BASE64
-     ************************************************************/
+    /***********************************************
+     * DATEN EINTRAGEN (FORMATIERUNG BLEIBT!)
+     ***********************************************/
+    rows.forEach((rowData, i) => {
+      const excelRow = ws.getRow(startRow + i);
+
+      // "Anzahl" — sofern im Template
+      if (colMap["Anzahl"]) {
+        excelRow.getCell(colMap["Anzahl"]).value = String(i + 1);
+      }
+
+      // Jede Variable in die vom Template vorgesehenen Spalten
+      column_order.forEach((key) => {
+        const col = colMap[key];
+        if (!col) return; // Template hat die Spalte nicht → überspringen
+        excelRow.getCell(col).value = rowData[key] ?? "";
+      });
+
+      // "No." falls im Template
+      if (colMap["No."]) {
+        excelRow.getCell(colMap["No."]).value = String(i + 1);
+      }
+    });
+
+    /***********************************************
+     * EXPORT
+     ***********************************************/
     const out = await wb.xlsx.writeBuffer();
 
     return res.status(200).json({
       file: Buffer.from(out).toString("base64"),
       fileName: `${prefix}_Festdaten.xlsx`,
       success: true,
-      version: "template-mode-clean",
+      version: "template-perfect",
     });
 
   } catch (err) {
