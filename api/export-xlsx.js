@@ -6,81 +6,98 @@ export const config = {
 
 export default async function handler(req, res) {
   try {
-    const body =
-      typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
 
-    const {
-      templateBase64,
-      headerOrder,
-      rows,
-      prefix = "SITE",
-      fallzahl
-    } = body;
+    const { templateBase64, headerOrder, rows, prefix = "SITE" } = body;
 
     if (!templateBase64) throw new Error("templateBase64 missing");
-    if (!Array.isArray(headerOrder) || !headerOrder.length)
-      throw new Error("headerOrder missing");
-    if (!Array.isArray(rows))
-      throw new Error("rows missing");
+    if (!Array.isArray(headerOrder)) throw new Error("headerOrder missing");
+    if (!Array.isArray(rows)) throw new Error("rows missing");
 
-    /****************************************************
-     * Workbook laden
-     ****************************************************/
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.load(Buffer.from(templateBase64, "base64"));
     const ws = wb.worksheets[0];
 
-    /****************************************************
-     * 1) Erste komplett leere Zeile unter Block A finden
-     ****************************************************/
-    let insertRow = null;
+    /***********************************************
+     * 1) MATRIX-START ERKENNEN (universal)
+     ***********************************************/
+    let headerRowIndex = null;
+    let dataStartIndex = null;
 
-    ws.eachRow((row, rowNr) => {
-      const filled = row.values.filter(
-        (v) => v !== null && v !== ""
-      ).length;
-      if (filled === 0 && insertRow === null) {
-        insertRow = rowNr;
+    ws.eachRow((row, rowIdx) => {
+      const values = row.values;
+
+      const isHeaderCandidate =
+        values.filter((v) => typeof v === "string" && v.trim() !== "").length >= 3;
+
+      const isDataCandidate =
+        typeof values[1] === "number" ||
+        (typeof values[1] === "string" && /^\d+$/.test(values[1]));
+
+      if (isHeaderCandidate && !headerRowIndex) {
+        headerRowIndex = rowIdx;
+      }
+
+      if (isDataCandidate && !dataStartIndex) {
+        dataStartIndex = rowIdx;
       }
     });
 
-    if (!insertRow) insertRow = ws.rowCount + 1;
+    const matrixIsPresent = headerRowIndex && dataStartIndex;
 
-    /****************************************************
-     * 2) Headerzeile erzeugen + STYLEN
-     ****************************************************/
-    const header = ["Anzahl", ...headerOrder, "No."];
-    const headerRow = ws.getRow(insertRow);
+    /***********************************************
+     * 2) MATRIX-HEADER SETZEN (falls nötig)
+     ***********************************************/
+    let writeHeaderAt = null;
 
-    header.forEach((val, i) => {
-      headerRow.getCell(i + 1).value = val;
-    });
+    if (matrixIsPresent) {
+      writeHeaderAt = headerRowIndex;
+    } else {
+      // Typ A Templates (isi, Mischfett)
+      // wir suchen erste komplett "technisch leere" Zeile (keine Persona)
+      let firstEmpty = null;
+      ws.eachRow((row, idx) => {
+        const filled = row.values.filter((v) => v !== null && v !== "").length;
+        if (filled === 0 && !firstEmpty) firstEmpty = idx;
+      });
 
-    // ✅ Styling
-    headerRow.eachCell((cell) => {
-      cell.font = { bold: true, color: { argb: "FFFFFFFF" } };   // Weißer Text
-      cell.fill = {
-        type: "pattern",
-        pattern: "solid",
-        fgColor: { argb: "FF005BBB" },   // Blau
-      };
-      cell.alignment = { vertical: "middle", horizontal: "center" };
-      cell.border = {
-        top: { style: "thin" },
-        left: { style: "thin" },
-        bottom: { style: "thin" },
-        right: { style: "thin" },
-      };
-    });
+      writeHeaderAt = firstEmpty || ws.rowCount + 1;
 
-    headerRow.commit();
+      // Header schreiben
+      const headerRow = ws.getRow(writeHeaderAt);
+      const header = ["Anzahl", ...headerOrder, "No."];
 
-    /****************************************************
-     * 3) Datenmatrix einfügen
-     ****************************************************/
+      header.forEach((v, i) => {
+        headerRow.getCell(i + 1).value = v;
+      });
+
+      // style
+      headerRow.eachCell((cell) => {
+        cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+        cell.fill = {
+          type: "pattern",
+          pattern: "solid",
+          fgColor: { argb: "FF005BBB" },
+        };
+        cell.alignment = { horizontal: "center", vertical: "middle" };
+        cell.border = {
+          top: { style: "thin" },
+          left: { style: "thin" },
+          bottom: { style: "thin" },
+          right: { style: "thin" },
+        };
+      });
+
+      headerRow.commit();
+
+      dataStartIndex = writeHeaderAt + 1;
+    }
+
+    /***********************************************
+     * 3) ROWS schreiben (universell)
+     ***********************************************/
     rows.forEach((src, i) => {
-      const excelRow = ws.getRow(insertRow + 1 + i);
-
+      const excelRow = ws.getRow(dataStartIndex + i);
       excelRow.getCell(1).value = i + 1;
 
       headerOrder.forEach((key, idx) => {
@@ -88,11 +105,12 @@ export default async function handler(req, res) {
       });
 
       excelRow.getCell(headerOrder.length + 2).value = i + 1;
+      excelRow.commit();
     });
 
-    /****************************************************
-     * 4) Datei erzeugen
-     ****************************************************/
+    /***********************************************
+     * 4) Datei zurückgeben
+     ***********************************************/
     const out = await wb.xlsx.writeBuffer();
 
     return res.status(200).json({
@@ -100,10 +118,7 @@ export default async function handler(req, res) {
       fileName: `${prefix}_Festdaten.xlsx`,
       success: true,
     });
-
   } catch (err) {
-    return res.status(500).json({
-      error: err.message || "unknown error",
-    });
+    res.status(500).json({ error: err.message });
   }
 }
