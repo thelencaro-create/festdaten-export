@@ -6,16 +6,21 @@ export const config = {
 
 export default async function handler(req, res) {
   try {
+    const body =
+      typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+
     const {
       templateBase64,
+      headerOrder,
       rows,
-      column_order,
       prefix = "SITE",
-    } = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    } = body;
 
     if (!templateBase64) throw new Error("templateBase64 missing");
-    if (!rows || !Array.isArray(rows)) throw new Error("rows missing");
-    if (!column_order || !column_order.length) throw new Error("column_order missing");
+    if (!Array.isArray(headerOrder) || !headerOrder.length)
+      throw new Error("headerOrder missing");
+    if (!Array.isArray(rows))
+      throw new Error("rows missing");
 
     // Workbook laden
     const wb = new ExcelJS.Workbook();
@@ -23,34 +28,30 @@ export default async function handler(req, res) {
     const ws = wb.worksheets[0];
 
     /****************************************************
-     * 1) Erste komplett leere Zeile finden
-     *    (unterhalb des vertikalen Block A)
+     * 1) Erste komplett leere Zeile nach vertikalem Block
      ****************************************************/
-    let insertHeaderAt = null;
+    let insertRow = null;
 
     ws.eachRow((row, rowNr) => {
-      const filled = row.values.filter(v => v !== null && v !== "").length;
-      if (filled === 0 && !insertHeaderAt) {
-        insertHeaderAt = rowNr;
+      const filled = row.values.filter(
+        (v) => v !== null && v !== ""
+      ).length;
+      if (filled === 0 && insertRow === null) {
+        insertRow = rowNr;
       }
     });
 
-    if (!insertHeaderAt) {
-      insertHeaderAt = ws.rowCount + 1;
+    if (!insertRow) {
+      insertRow = ws.rowCount + 1;
     }
 
     /****************************************************
-     * 2) Horizontale Headerzeile erzeugen
+     * 2) Headerzeile erzeugen
      ****************************************************/
-    const headerRow = ws.getRow(insertHeaderAt);
+    const header = ["Anzahl", ...headerOrder, "No."];
+    const headerRow = ws.getRow(insertRow);
 
-    const headerValues = [
-      "Anzahl",
-      ...column_order,
-      "No."
-    ];
-
-    headerValues.forEach((val, idx) => {
+    header.forEach((val, idx) => {
       headerRow.getCell(idx + 1).value = val;
     });
 
@@ -60,15 +61,18 @@ export default async function handler(req, res) {
      * 3) Daten einfügen
      ****************************************************/
     rows.forEach((src, i) => {
-      const excelRow = ws.getRow(insertHeaderAt + 1 + i);
+      const excelRow = ws.getRow(insertRow + 1 + i);
 
-      excelRow.getCell(1).value = i + 1; // Anzahl
+      // Anzahl
+      excelRow.getCell(1).value = i + 1;
 
-      column_order.forEach((key, idx) => {
+      // Daten-Spalten
+      headerOrder.forEach((key, idx) => {
         excelRow.getCell(idx + 2).value = src[key] ?? "";
       });
 
-      excelRow.getCell(column_order.length + 2).value = i + 1; // No.
+      // No.-Spalte
+      excelRow.getCell(headerOrder.length + 2).value = i + 1;
     });
 
     const out = await wb.xlsx.writeBuffer();
@@ -78,8 +82,9 @@ export default async function handler(req, res) {
       fileName: `${prefix}_Festdaten.xlsx`,
       success: true,
     });
-
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({
+      error: err.message,
+    });
   }
 }
