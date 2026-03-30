@@ -14,6 +14,7 @@ export default async function handler(req, res) {
       headerOrder,
       rows,
       prefix = "SITE",
+      fallzahl
     } = body;
 
     if (!templateBase64) throw new Error("templateBase64 missing");
@@ -22,13 +23,15 @@ export default async function handler(req, res) {
     if (!Array.isArray(rows))
       throw new Error("rows missing");
 
-    // Workbook laden
+    /****************************************************
+     * Workbook laden
+     ****************************************************/
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.load(Buffer.from(templateBase64, "base64"));
     const ws = wb.worksheets[0];
 
     /****************************************************
-     * 1) Erste komplett leere Zeile nach vertikalem Block
+     * 1) Erste komplett leere Zeile unter Block A finden
      ****************************************************/
     let insertRow = null;
 
@@ -41,40 +44,55 @@ export default async function handler(req, res) {
       }
     });
 
-    if (!insertRow) {
-      insertRow = ws.rowCount + 1;
-    }
+    if (!insertRow) insertRow = ws.rowCount + 1;
 
     /****************************************************
-     * 2) Headerzeile erzeugen
+     * 2) Headerzeile erzeugen + STYLEN
      ****************************************************/
     const header = ["Anzahl", ...headerOrder, "No."];
     const headerRow = ws.getRow(insertRow);
 
-    header.forEach((val, idx) => {
-      headerRow.getCell(idx + 1).value = val;
+    header.forEach((val, i) => {
+      headerRow.getCell(i + 1).value = val;
+    });
+
+    // ✅ Styling
+    headerRow.eachCell((cell) => {
+      cell.font = { bold: true, color: { argb: "FFFFFFFF" } };   // Weißer Text
+      cell.fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "FF005BBB" },   // Blau
+      };
+      cell.alignment = { vertical: "middle", horizontal: "center" };
+      cell.border = {
+        top: { style: "thin" },
+        left: { style: "thin" },
+        bottom: { style: "thin" },
+        right: { style: "thin" },
+      };
     });
 
     headerRow.commit();
 
     /****************************************************
-     * 3) Daten einfügen
+     * 3) Datenmatrix einfügen
      ****************************************************/
     rows.forEach((src, i) => {
       const excelRow = ws.getRow(insertRow + 1 + i);
 
-      // Anzahl
       excelRow.getCell(1).value = i + 1;
 
-      // Daten-Spalten
       headerOrder.forEach((key, idx) => {
         excelRow.getCell(idx + 2).value = src[key] ?? "";
       });
 
-      // No.-Spalte
       excelRow.getCell(headerOrder.length + 2).value = i + 1;
     });
 
+    /****************************************************
+     * 4) Datei erzeugen
+     ****************************************************/
     const out = await wb.xlsx.writeBuffer();
 
     return res.status(200).json({
@@ -82,9 +100,10 @@ export default async function handler(req, res) {
       fileName: `${prefix}_Festdaten.xlsx`,
       success: true,
     });
+
   } catch (err) {
     return res.status(500).json({
-      error: err.message,
+      error: err.message || "unknown error",
     });
   }
 }
